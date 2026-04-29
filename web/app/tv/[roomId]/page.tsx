@@ -175,11 +175,17 @@ export default function TvPage() {
   }, [stream?.expires_at, playing?.video_id]);
 
   // Recover from forbidden / network errors on the video element by re-fetching the stream.
+  // Throttle: a flaky CDN can fire `error` repeatedly while the front of the song is
+  // still settling, which without a cooldown loops re-fetch → reset src → reload-from-0
+  // and feels like the video keeps restarting.
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !playing) return;
+    let lastFetchAt = 0;
     const onError = () => {
-      // MediaError code 4 = MEDIA_ERR_SRC_NOT_SUPPORTED, often the symptom of an expired CDN URL.
+      const now = Date.now();
+      if (now - lastFetchAt < 5000) return;
+      lastFetchAt = now;
       api.getStream(playing.video_id).then(setStream).catch(console.error);
     };
     v.addEventListener("error", onError);
@@ -193,25 +199,52 @@ export default function TvPage() {
     v.muted = !!externalAudioUrl;
   }, [externalAudioUrl]);
 
-  // Sync external audio track with video time (DASH split streams or instrumental)
+  // Sync external audio track with video time (DASH split / instrumental).
+  // Hard-seeking every 500ms on a 0.1s drift caused audible stutter at song
+  // start: the seek lands in still-buffering territory, audio stalls, drift
+  // grows, we seek again — loop. Instead nudge playbackRate for small drift,
+  // hard-seek (debounced) only when truly out of sync, and skip the tick
+  // entirely while audio is mid-seek or under-buffered.
   useEffect(() => {
     const v = videoRef.current;
     const a = audioRef.current;
     if (!v || !a || !externalAudioUrl) return;
+    let lastSeekAt = 0;
     const sync = () => {
-      if (Math.abs(a.currentTime - v.currentTime) > 0.1) a.currentTime = v.currentTime;
+      if (a.seeking || a.readyState < 2) return;
+      const drift = a.currentTime - v.currentTime;
+      const abs = Math.abs(drift);
+      if (abs > 0.5) {
+        const now = performance.now();
+        if (now - lastSeekAt < 1500) return;
+        lastSeekAt = now;
+        a.currentTime = v.currentTime;
+        a.playbackRate = 1;
+        return;
+      }
+      if (abs > 0.05) {
+        a.playbackRate = drift < 0 ? 1.02 : 0.98;
+      } else {
+        a.playbackRate = 1;
+      }
     };
     const onPlay = () => a.play().catch(() => {});
     const onPause = () => a.pause();
+    const onSeek = () => {
+      a.currentTime = v.currentTime;
+      a.playbackRate = 1;
+      lastSeekAt = performance.now();
+    };
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
-    v.addEventListener("seeked", sync);
+    v.addEventListener("seeked", onSeek);
     const tick = setInterval(sync, 500);
     return () => {
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
-      v.removeEventListener("seeked", sync);
+      v.removeEventListener("seeked", onSeek);
       clearInterval(tick);
+      a.playbackRate = 1;
     };
   }, [externalAudioUrl]);
 
