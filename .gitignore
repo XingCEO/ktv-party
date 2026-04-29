@@ -61,7 +61,13 @@ logs/
 .env.local
 .env.*.local
 
-# OMC state
-.omc/state/
-.omc/logs/
-.omc/research/
+# OMC state (per-tree, never checked in)
+.omc/
+api/.omc/
+web/.omc/
+
+# Claude Code transient
+.claude/
+
+# Debug artifacts
+data/_dbg.json

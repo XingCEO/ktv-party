@@ -14,6 +14,14 @@ export class RoomSocket {
   private url(): string {
     if (this.baseUrl) return `${this.baseUrl}/ws/rooms/${this.roomId}`;
     if (typeof window === "undefined") return "";
+    // Public-tunnel mode: NEXT_PUBLIC_WS_BASE points at whatever URL fronts the
+    // FastAPI server (e.g. a cloudflared tunnel for port 8000). When unset we
+    // fall back to LAN-mode by swapping the page port for :8000.
+    const envBase = process.env.NEXT_PUBLIC_WS_BASE;
+    if (envBase) {
+      const base = envBase.replace(/^http/, "ws").replace(/\/$/, "");
+      return `${base}/ws/rooms/${this.roomId}`;
+    }
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
     return `${proto}//${host.replace(/:\d+$/, ":8000")}/ws/rooms/${this.roomId}`;

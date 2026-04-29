@@ -40,7 +40,7 @@ from .schemas import (
     StreamInfo,
     VocalModeUpdate,
 )
-from .services import demucs_worker, lyrics, youtube
+from .services import audio_simple, demucs_worker, lyrics, youtube
 from .ws import broker, safe_broadcast
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,7 @@ async def healthz() -> HealthResponse:
         version=VERSION,
         demucs_available=demucs_worker.is_demucs_available(),
         cuda_available=demucs_worker._check_cuda(),
+        simple_vocal_removal_available=audio_simple.is_simple_available(),
     )
 
 
@@ -177,10 +178,24 @@ async def add_to_queue(room_id: str, payload: QueueAdd) -> QueueItem:
         "item": item.model_dump(),
         "queue": [i.model_dump() for i in full],
     })
-    # Pre-warm instrumental if requested
-    if payload.vocal_mode == "instrumental" and demucs_worker.is_demucs_available():
+    # Pre-warm instrumental if requested. Demucs (GPU/CPU ML) is preferred
+    # when available; otherwise we fall back to ffmpeg center-channel
+    # cancellation, which runs on any CPU and produces a usable karaoke track.
+    if payload.vocal_mode == "instrumental" and (
+        demucs_worker.is_demucs_available() or audio_simple.is_simple_available()
+    ):
         asyncio.create_task(_prewarm_instrumental(room_id, payload.video_id))
+    # Pre-warm lyrics so the TV doesn't pay 10-30s of lrclib RTT when the song
+    # actually starts. Channel was just upserted into songs table by add_to_queue.
+    asyncio.create_task(_prewarm_lyrics(payload.video_id, payload.title, payload.channel))
     return item
+
+
+async def _prewarm_lyrics(video_id: str, title: str, channel: Optional[str]) -> None:
+    try:
+        await lyrics.get_lyrics(video_id, title=title, artist=channel)
+    except Exception as exc:
+        logger.warning("prewarm lyrics failed video_id=%s: %s", video_id, exc)
 
 
 async def _prewarm_instrumental(room_id: str, video_id: str) -> None:
@@ -191,10 +206,21 @@ async def _prewarm_instrumental(room_id: str, video_id: str) -> None:
                 "video_id": video_id, "path": str(existing),
             })
             return
-        mp4 = await youtube.download_mp4(video_id)
-        await demucs_worker.enqueue(video_id, mp4, on_complete=_on_demucs_complete(room_id))
+        if demucs_worker.is_demucs_available():
+            mp4 = await youtube.download_mp4(video_id)
+            await demucs_worker.enqueue(video_id, mp4, on_complete=_on_demucs_complete(room_id))
+            return
+        # No Demucs — use ffmpeg center-channel cancellation. This is fast
+        # enough to run inline; no queue needed.
+        produced = await audio_simple.make_karaoke(video_id)
+        await safe_broadcast(room_id, "vocal_removal.ready", {
+            "video_id": video_id, "path": str(produced),
+        })
     except Exception as exc:
         logger.warning("prewarm instrumental failed video_id=%s: %s", video_id, exc)
+        await safe_broadcast(room_id, "vocal_removal.failed", {
+            "video_id": video_id, "error": str(exc),
+        })
 
 
 def _on_demucs_complete(room_id: str):
@@ -248,6 +274,17 @@ async def update_vocal_mode(room_id: str, item_id: int, payload: VocalModeUpdate
     await safe_broadcast(room_id, "queue.vocal_mode.updated", {
         "item_id": item_id, "vocal_mode": payload.vocal_mode,
     })
+    # Mirror add_to_queue behavior — kick off vocal removal so the singer doesn't have
+    # to wait when they actually press play. Toggling back to original is a no-op.
+    if payload.vocal_mode == "instrumental" and (
+        demucs_worker.is_demucs_available() or audio_simple.is_simple_available()
+    ):
+        row = next(
+            (i for i in queue_repo.list_queue(room_id, include_done=True) if i.id == item_id),
+            None,
+        )
+        if row:
+            asyncio.create_task(_prewarm_instrumental(room_id, row.video_id))
 
 
 @app.post("/api/rooms/{room_id}/playback/next", response_model=Optional[QueueItem])
@@ -292,6 +329,7 @@ async def get_lyrics(
     video_id: str,
     title: Optional[str] = None,
     artist: Optional[str] = None,
+    force: bool = False,
 ) -> LyricsResponse:
     settings = get_settings()
     vtt = settings.subs_dir / f"{video_id}.vtt"
@@ -300,22 +338,39 @@ async def get_lyrics(
         for cand in settings.subs_dir.glob(f"{video_id}*.vtt"):
             vtt_path = str(cand)
             break
-    return await lyrics.get_lyrics(video_id, title=title, artist=artist, vtt_path=vtt_path)
+    # If no artist supplied, fall back to the YouTube channel we cached on add —
+    # lrclib's exact-match /api/get is a lot more reliable with an artist hint.
+    if not artist:
+        from .db import get_conn
+        row = get_conn().execute(
+            "SELECT channel FROM songs WHERE video_id = ?", (video_id,),
+        ).fetchone()
+        if row and row["channel"]:
+            artist = row["channel"]
+    return await lyrics.get_lyrics(
+        video_id, title=title, artist=artist, vtt_path=vtt_path, force=force,
+    )
 
 
 @app.post("/api/songs/{video_id}/instrumental", status_code=202)
 async def request_instrumental(video_id: str) -> dict:
-    if not demucs_worker.is_demucs_available():
-        raise HTTPException(503, "demucs not available on this server")
     existing = demucs_worker.find_existing_instrumental(video_id)
     if existing:
         return {"status": "done", "video_id": video_id, "path": str(existing)}
-    try:
-        mp4 = await youtube.download_mp4(video_id)
-    except Exception as exc:
-        raise HTTPException(502, f"download failed: {exc}")
-    job_id = await demucs_worker.enqueue(video_id, mp4)
-    return {"status": "queued", "job_id": job_id, "video_id": video_id}
+    if demucs_worker.is_demucs_available():
+        try:
+            mp4 = await youtube.download_mp4(video_id)
+        except Exception as exc:
+            raise HTTPException(502, f"download failed: {exc}")
+        job_id = await demucs_worker.enqueue(video_id, mp4)
+        return {"status": "queued", "job_id": job_id, "video_id": video_id, "method": "demucs"}
+    if audio_simple.is_simple_available():
+        try:
+            produced = await audio_simple.make_karaoke(video_id)
+        except Exception as exc:
+            raise HTTPException(502, f"karaoke render failed: {exc}")
+        return {"status": "done", "video_id": video_id, "path": str(produced), "method": "center_cancel"}
+    raise HTTPException(503, "no vocal-removal backend available (need demucs or ffmpeg)")
 
 
 @app.get("/api/songs/{video_id}/instrumental/file")

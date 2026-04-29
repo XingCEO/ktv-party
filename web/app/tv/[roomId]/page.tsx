@@ -28,14 +28,26 @@ export default function TvPage() {
   const [qrUrl, setQrUrl] = useState<string>("");
   const [phoneUrl, setPhoneUrl] = useState<string>("");
   const [now, setNow] = useState(0);
-  const [videoTime, setVideoTime] = useState(0);
   const [atmosphere, setAtmosphere] = useState<{ kind: any; ts: number } | null>(null);
   const [emojiTrigger, setEmojiTrigger] = useState<{ kind: string; ts: number } | null>(null);
+  const [lyricsExpanded, setLyricsExpanded] = useState(false);
+  // Sync nudge: positive value makes lyrics appear earlier (compensates intro padding
+  // on YouTube uploads vs. lrclib's album-master timing). Re-zeroed per song.
+  const [lyricOffsetSec, setLyricOffsetSec] = useState(0);
+  const [activeLyricIdx, setActiveLyricIdx] = useState(-1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const wsRef = useRef<RoomSocket | null>(null);
+  const lastVideoIdRef = useRef<string | null>(null);
+  const activeIdxRef = useRef(-1);
+  const fetchTokenRef = useRef<string | null>(null);
 
   const playing = useMemo(() => queue.find((q) => q.status === "playing") || null, [queue]);
+  const externalAudioUrl = useMemo(() => {
+    if (!stream) return null;
+    if (playing?.vocal_mode === "instrumental" && stream.instrumental_url) return stream.instrumental_url;
+    return stream.audio_url || null;
+  }, [stream, playing?.vocal_mode]);
 
   // Initial load + QR
   useEffect(() => {
@@ -71,6 +83,12 @@ export default function TvPage() {
         // reload stream to pick up instrumental
         api.getStream(playing.video_id).then(setStream).catch(console.error);
       }
+      if (m.event === "room.timer.started" || m.event === "room.timer.reset") {
+        setTimer(m.data as RoomTimer);
+      }
+      if (m.event === "room.snapshot" && m.data.timer) {
+        setTimer(m.data.timer);
+      }
     });
     ws.connect();
     return () => {
@@ -79,62 +97,123 @@ export default function TvPage() {
     };
   }, [roomId, playing?.video_id]);
 
-  // When playing changes, fetch stream + lyrics
+  // When playing changes, fetch stream + lyrics. Clear immediately so the
+  // previous song's lyrics don't linger, and guard against a late response
+  // for the previous song stomping the current one.
   useEffect(() => {
     if (!playing) {
       setStream(null);
       setLyrics(null);
       return;
     }
-    api.getStream(playing.video_id).then(setStream).catch(console.error);
-    api.getLyrics(playing.video_id, playing.title).then(setLyrics).catch(console.error);
+    setStream(null);
+    setLyrics(null);
+    const myId = playing.video_id;
+    fetchTokenRef.current = myId;
+    api.getStream(myId).then((s) => {
+      if (fetchTokenRef.current === myId) setStream(s);
+    }).catch(console.error);
+    api.getLyrics(myId, playing.title).then((l) => {
+      if (fetchTokenRef.current === myId) setLyrics(l);
+    }).catch(console.error);
   }, [playing?.video_id, playing?.title]);
 
-  // Auto-attach video element + handle ended event + drive lyric time
+  // Auto-attach ended handler. (currentTime is read in the rAF tick below, not
+  // via timeupdate, since timeupdate only fires ~4Hz on most browsers.)
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !stream) return;
     const onEnded = async () => {
       await api.playbackNext(roomId).catch(console.error);
     };
-    const onTime = () => setVideoTime(v.currentTime);
     v.addEventListener("ended", onEnded);
-    v.addEventListener("timeupdate", onTime);
-    return () => {
-      v.removeEventListener("ended", onEnded);
-      v.removeEventListener("timeupdate", onTime);
-    };
+    return () => v.removeEventListener("ended", onEnded);
   }, [stream, roomId]);
 
-  // Mute video when instrumental mode is active and instrumental is available
+  // Drive video src imperatively so re-fetched stream URLs (mid-song refresh)
+  // can keep currentTime instead of yanking the singer back to t=0.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !stream) return;
+    const sameSong = lastVideoIdRef.current === stream.video_id;
+    const resumeAt = sameSong ? v.currentTime : 0;
+    const wasPlaying = sameSong && !v.paused;
+    v.src = stream.video_url;
+    const onLoaded = () => {
+      if (resumeAt > 0.5) v.currentTime = resumeAt;
+      if (wasPlaying || !sameSong) v.play().catch(() => {});
+    };
+    v.addEventListener("loadedmetadata", onLoaded, { once: true });
+    lastVideoIdRef.current = stream.video_id;
+    return () => v.removeEventListener("loadedmetadata", onLoaded);
+  }, [stream?.video_url, stream?.video_id]);
+
+  // Same trick for the external audio track when present.
+  useEffect(() => {
+    const a = audioRef.current;
+    const v = videoRef.current;
+    if (!a || !externalAudioUrl) return;
+    const resumeAt = v ? v.currentTime : 0;
+    a.src = externalAudioUrl;
+    const onLoaded = () => {
+      if (resumeAt > 0.5) a.currentTime = resumeAt;
+      if (v && !v.paused) a.play().catch(() => {});
+    };
+    a.addEventListener("loadedmetadata", onLoaded, { once: true });
+    return () => a.removeEventListener("loadedmetadata", onLoaded);
+  }, [externalAudioUrl]);
+
+  // Stream URLs from yt-dlp expire (typ. ~6h). Re-fetch shortly before expiry so
+  // long-running playback / idle TV doesn't break with a 403 mid-song.
+  useEffect(() => {
+    if (!playing || !stream?.expires_at) return;
+    const refreshAtMs = Math.max(5_000, (stream.expires_at - 600) * 1000 - Date.now());
+    const t = setTimeout(() => {
+      api.getStream(playing.video_id).then(setStream).catch(console.error);
+    }, refreshAtMs);
+    return () => clearTimeout(t);
+  }, [stream?.expires_at, playing?.video_id]);
+
+  // Recover from forbidden / network errors on the video element by re-fetching the stream.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !playing) return;
+    const onError = () => {
+      // MediaError code 4 = MEDIA_ERR_SRC_NOT_SUPPORTED, often the symptom of an expired CDN URL.
+      api.getStream(playing.video_id).then(setStream).catch(console.error);
+    };
+    v.addEventListener("error", onError);
+    return () => v.removeEventListener("error", onError);
+  }, [playing?.video_id]);
+
+  // Mute video when an external audio track is in use (split DASH or instrumental)
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const wantInstrumental = playing?.vocal_mode === "instrumental" && !!stream?.instrumental_url;
-    v.muted = wantInstrumental;
-  }, [playing?.vocal_mode, stream?.instrumental_url]);
+    v.muted = !!externalAudioUrl;
+  }, [externalAudioUrl]);
 
-  // Sync audio (instrumental) playback with video time
+  // Sync external audio track with video time (DASH split streams or instrumental)
   useEffect(() => {
     const v = videoRef.current;
     const a = audioRef.current;
-    if (!v || !a || !stream?.instrumental_url) return;
+    if (!v || !a || !externalAudioUrl) return;
     const sync = () => {
-      if (Math.abs(a.currentTime - v.currentTime) > 0.3) a.currentTime = v.currentTime;
+      if (Math.abs(a.currentTime - v.currentTime) > 0.1) a.currentTime = v.currentTime;
     };
     const onPlay = () => a.play().catch(() => {});
     const onPause = () => a.pause();
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
     v.addEventListener("seeked", sync);
-    const tick = setInterval(sync, 1500);
+    const tick = setInterval(sync, 500);
     return () => {
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
       v.removeEventListener("seeked", sync);
       clearInterval(tick);
     };
-  }, [stream?.instrumental_url]);
+  }, [externalAudioUrl]);
 
   // Cost timer ticker (1Hz local extrapolation)
   useEffect(() => {
@@ -160,16 +239,65 @@ export default function TvPage() {
     await api.playbackNext(roomId);
   }
 
-  // Determine active lyric line (driven by video timeupdate, not the 1Hz cost ticker)
-  const activeLyricIdx = useMemo(() => {
-    if (!lyrics?.lines.length) return -1;
-    let idx = -1;
-    for (let i = 0; i < lyrics.lines.length; i++) {
-      if (lyrics.lines[i].time <= videoTime) idx = i;
-      else break;
+  // Drive active-lyric tracking from rAF — `<video>` timeupdate only fires ~4Hz
+  // and produced visible 100-250ms lag at line transitions. Reading currentTime
+  // directly per frame and only setStating when the line index changes keeps
+  // re-renders cheap while making the highlight feel exact.
+  useEffect(() => {
+    if (!lyrics?.lines.length || !playing) {
+      activeIdxRef.current = -1;
+      setActiveLyricIdx(-1);
+      return;
     }
-    return idx;
-  }, [lyrics, videoTime]);
+    let raf = 0;
+    const tick = () => {
+      const v = videoRef.current;
+      if (v) {
+        const t = v.currentTime + lyricOffsetSec;
+        let idx = -1;
+        const lines = lyrics.lines;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].time <= t) idx = i;
+          else break;
+        }
+        if (idx !== activeIdxRef.current) {
+          activeIdxRef.current = idx;
+          setActiveLyricIdx(idx);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [lyrics, playing?.video_id, lyricOffsetSec]);
+
+  // Per-song offset is sticky — once a singer dials in the right number for a
+  // particular YouTube upload (intro padding varies), replaying it later (or
+  // later in the same party) reuses the same offset instead of resetting to 0.
+  useEffect(() => {
+    if (!playing) return;
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(`ktv-lyric-offset-${playing.video_id}`);
+      setLyricOffsetSec(raw ? Number(raw) || 0 : 0);
+    } catch {
+      setLyricOffsetSec(0);
+    }
+  }, [playing?.video_id]);
+
+  function nudgeOffset(delta: number) {
+    setLyricOffsetSec((v) => {
+      const next = Math.round((v + delta) * 10) / 10;
+      if (playing && typeof window !== "undefined") {
+        try {
+          window.localStorage.setItem(`ktv-lyric-offset-${playing.video_id}`, String(next));
+        } catch {
+          /* quota — ignore */
+        }
+      }
+      return next;
+    });
+  }
 
   return (
     <main className="min-h-screen flex flex-col bg-ktv-bg text-white">
@@ -197,6 +325,47 @@ export default function TvPage() {
             <button className="btn-ghost" onClick={resetTimer}>重置</button>
           )}
           <button className="btn-ghost" onClick={skipSong}>下一首</button>
+          <button
+            className="btn-ghost"
+            onClick={() => setLyricsExpanded((v) => !v)}
+            title="切換歌詞大小"
+          >
+            {lyricsExpanded ? "縮小歌詞" : "放大歌詞"}
+          </button>
+          {playing && (
+            <button
+              className="btn-ghost"
+              onClick={() => {
+                setLyrics(null);
+                api
+                  .getLyrics(playing.video_id, playing.title, undefined, true)
+                  .then(setLyrics)
+                  .catch(console.error);
+              }}
+              title="重新抓取歌詞 (清空快取)"
+            >
+              重抓歌詞
+            </button>
+          )}
+          {playing && lyrics?.lines.length ? (
+            <div className="flex items-center gap-1 text-sm" title="歌詞時間微調 (此曲記住)">
+              <button className="btn-ghost px-2" onClick={() => nudgeOffset(-1.0)} title="歌詞慢 1 秒">
+                ⏮
+              </button>
+              <button className="btn-ghost px-2" onClick={() => nudgeOffset(-0.3)} title="歌詞慢 0.3 秒">
+                ⏪
+              </button>
+              <span className="font-mono text-xs text-ktv-gold w-14 text-center">
+                {lyricOffsetSec >= 0 ? "+" : ""}{lyricOffsetSec.toFixed(1)}s
+              </span>
+              <button className="btn-ghost px-2" onClick={() => nudgeOffset(0.3)} title="歌詞快 0.3 秒">
+                ⏩
+              </button>
+              <button className="btn-ghost px-2" onClick={() => nudgeOffset(1.0)} title="歌詞快 1 秒">
+                ⏭
+              </button>
+            </div>
+          ) : null}
         </div>
       </header>
 
@@ -207,16 +376,19 @@ export default function TvPage() {
           {playing && stream ? (
             <>
               <div className="relative bg-black flex-1 min-h-0">
+                {/* src is set imperatively in an effect so URL refreshes don't reset currentTime */}
                 <video
                   ref={videoRef}
-                  src={stream.video_url}
                   autoPlay
-                  controls
                   playsInline
+                  // Set muted via JSX prop so the autoplay attempt sees the right
+                  // value at first paint — setting it later via an effect was
+                  // racing the autoplay policy and could leave the element paused.
+                  muted={!!externalAudioUrl}
                   className="w-full h-full object-contain"
                 />
-                {stream.instrumental_url && playing.vocal_mode === "instrumental" && (
-                  <audio ref={audioRef} src={stream.instrumental_url} preload="auto" />
+                {externalAudioUrl && (
+                  <audio ref={audioRef} preload="auto" />
                 )}
                 <div className="absolute top-4 left-4 panel px-3 py-1 text-sm">
                   <span className="text-ktv-gold font-bold">{playing.title}</span>
@@ -225,37 +397,75 @@ export default function TvPage() {
                     <span className="ml-2 pill bg-ktv-mic text-black">伴奏</span>
                   )}
                 </div>
-              </div>
-              {/* Lyrics */}
-              <div className="h-40 overflow-hidden border-t border-white/5 bg-black/40 px-6 py-3 flex flex-col items-center justify-center">
-                {lyrics?.lines.length ? (
-                  <AnimatePresence mode="popLayout">
-                    {lyrics.lines.slice(Math.max(0, activeLyricIdx - 1), activeLyricIdx + 3).map((l, i) => (
-                      <motion.div
-                        key={l.time + l.text}
-                        initial={{ opacity: 0, y: 30 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -20 }}
-                        transition={{ duration: 0.3 }}
-                        className={`lyric-line ${i === 1 || (activeLyricIdx === 0 && i === 0) ? "active" : ""}`}
-                      >
-                        {l.text}
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
-                ) : (
-                  <div className="text-white/40">
-                    {lyrics?.source === "fallback" ? "(本曲無歌詞)" : "歌詞載入中..."}
-                  </div>
-                )}
+                {/* Lyrics overlaid on the video — KTV-style. Gradient backdrop keeps text
+                    readable over busy MV footage. Active line is centered and large; a
+                    dimmed next-line preview sits below it. */}
+                <div
+                  className={`absolute inset-x-0 bottom-0 px-6 flex flex-col items-center justify-end pointer-events-none bg-gradient-to-t from-black/85 via-black/55 to-transparent transition-all duration-300 ${
+                    lyricsExpanded ? "pt-16 pb-10" : "pt-10 pb-6"
+                  }`}
+                >
+                  {lyrics?.lines.length ? (
+                    <>
+                      <AnimatePresence mode="wait">
+                        {activeLyricIdx >= 0 && lyrics.lines[activeLyricIdx] ? (
+                          <motion.div
+                            key={`active-${lyrics.lines[activeLyricIdx].time}`}
+                            initial={{ opacity: 0, y: 12 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -12 }}
+                            transition={{ duration: 0.12 }}
+                            className={`text-center font-extrabold text-ktv-gold leading-tight [text-shadow:_0_2px_8px_rgba(0,0,0,0.95),_0_0_2px_rgba(0,0,0,0.95)] ${
+                              lyricsExpanded ? "text-6xl md:text-7xl" : "text-4xl md:text-5xl"
+                            }`}
+                          >
+                            {lyrics.lines[activeLyricIdx].text}
+                          </motion.div>
+                        ) : (
+                          <motion.div
+                            key="prelude"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 0.6 }}
+                            exit={{ opacity: 0 }}
+                            className="text-white/60 text-xl [text-shadow:_0_2px_4px_rgba(0,0,0,0.95)]"
+                          >
+                            ♪ ♪ ♪
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                      {lyrics.lines[activeLyricIdx + 1] && (
+                        <div
+                          className={`mt-3 text-white/70 text-center leading-snug [text-shadow:_0_2px_6px_rgba(0,0,0,0.95)] ${
+                            lyricsExpanded ? "text-2xl" : "text-lg"
+                          }`}
+                        >
+                          {lyrics.lines[activeLyricIdx + 1].text}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-white/60 text-lg [text-shadow:_0_2px_4px_rgba(0,0,0,0.95)]">
+                      {lyrics?.source === "fallback" ? "(本曲無歌詞)" : "歌詞載入中..."}
+                    </div>
+                  )}
+                </div>
               </div>
             </>
           ) : (
-            // Idle splash
+            // Idle splash — show a giant QR so phones can join without squinting at the sidebar.
             <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8">
               <div className="text-6xl">🎤</div>
-              <div className="text-2xl text-white/70">等待點歌中...</div>
-              <div className="text-white/50">用手機掃描右側 QR 即可加入點唱</div>
+              <div className="text-3xl text-ktv-gold font-bold">等待點歌中</div>
+              {qrUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={qrUrl} alt="QR" className="w-72 h-72 rounded-2xl bg-white p-3 shadow-2xl" />
+              ) : (
+                <div className="w-72 h-72 bg-white/10 rounded-2xl" />
+              )}
+              <div className="text-xl text-white/70">手機掃描 QR 加入點唱</div>
+              {phoneUrl && (
+                <div className="text-sm text-white/40 break-all max-w-xl text-center">{phoneUrl}</div>
+              )}
             </div>
           )}
         </section>

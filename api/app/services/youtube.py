@@ -134,12 +134,16 @@ async def search(query: str, n: int = 10) -> list[SearchHit]:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
+        vid = d.get("id") or ""
+        # flat-playlist mode rarely populates the singular `thumbnail` field;
+        # fall back to the always-available YouTube CDN URL derived from video id.
+        thumb = d.get("thumbnail") or (f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else None)
         hits.append(SearchHit(
-            video_id=d.get("id") or "",
+            video_id=vid,
             title=d.get("title") or "",
             channel=d.get("channel"),
             duration_sec=int(d["duration"]) if d.get("duration") else None,
-            thumbnail_url=d.get("thumbnail"),
+            thumbnail_url=thumb,
             view_count=int(d["view_count"]) if d.get("view_count") else None,
         ))
     return [h for h in hits if h.video_id]
@@ -152,7 +156,7 @@ async def get_stream(video_id: str) -> StreamInfo:
 
     args = _common_args() + [
         "-J",
-        "-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--write-subs",
         "--write-auto-subs",
         "--sub-langs", "zh-Hant,zh-TW,zh-Hans,zh,en",
@@ -213,7 +217,8 @@ async def download_mp4(video_id: str) -> Path:
     if out.exists():
         return out
     args = _common_args() + [
-        "-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
         "-o", str(out),
         f"https://www.youtube.com/watch?v={video_id}",
     ]

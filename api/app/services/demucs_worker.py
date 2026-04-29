@@ -11,6 +11,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -50,22 +51,51 @@ def is_demucs_available() -> bool:
         return False
 
 
+def _extract_audio_to_wav(mp4: Path, wav: Path) -> None:
+    """torchaudio 2.5.x can't read MP4 video containers; extract audio first."""
+    from . import youtube
+    ffmpeg = youtube._ffmpeg_path()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not available for audio extraction")
+    wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg, "-y", "-i", str(mp4), "-vn", "-ac", "2", "-ar", "44100",
+           "-c:a", "pcm_s16le", str(wav)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                         encoding="utf-8", errors="replace")
+    if res.returncode != 0:
+        raise RuntimeError(f"ffmpeg extract failed: {res.stderr.strip()[:500]}")
+
+
 def _run_demucs_sync(input_path: Path, output_dir: Path, model: str) -> Path:
     """Run demucs as subprocess for isolation. Returns path to instrumental file."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Pre-extract to WAV — torchaudio 2.5.1 doesn't decode MP4 containers and
+    # the newer torchaudio (2.6+) requires torchcodec which is unreliable on
+    # Windows. Decoding via ffmpeg ourselves is portable and fast.
+    if input_path.suffix.lower() == ".mp4":
+        wav_path = output_dir / f"{input_path.stem}.wav"
+        if not wav_path.exists():
+            _extract_audio_to_wav(input_path, wav_path)
+        demucs_input = wav_path
+    else:
+        demucs_input = input_path
     cmd = [
-        "python", "-m", "demucs",
+        # Use the same interpreter that imported us so we don't accidentally
+        # invoke the Windows-store "python" stub or a different env.
+        sys.executable, "-m", "demucs",
         "--two-stems", "vocals",
         "-n", model,
         "-o", str(output_dir),
         "--mp3",
-        str(input_path),
+        str(demucs_input),
     ]
     logger.info("demucs cmd: %s", cmd)
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
                          encoding="utf-8", errors="replace")
     if res.returncode != 0:
-        raise RuntimeError(f"demucs failed: {res.stderr.strip()[:500]}")
+        # Surface both streams — demucs sometimes prints diagnostics to stdout.
+        msg = (res.stderr or "").strip() or (res.stdout or "").strip()
+        raise RuntimeError(f"demucs failed (exit {res.returncode}): {msg[-500:]}")
     # Demucs writes to {output_dir}/{model}/{stem_basename}/no_vocals.mp3
     base = input_path.stem
     cand = output_dir / model / base / "no_vocals.mp3"

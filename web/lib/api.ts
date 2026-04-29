@@ -122,10 +122,11 @@ export const api = {
 
   search: (q: string, n = 10) => req<SearchResult[]>(`/api/search?q=${encodeURIComponent(q)}&n=${n}`),
   getStream: (video_id: string) => req<StreamInfo>(`/api/songs/${video_id}/stream`),
-  getLyrics: (video_id: string, title?: string, artist?: string) => {
+  getLyrics: (video_id: string, title?: string, artist?: string, force?: boolean) => {
     const qs = new URLSearchParams();
     if (title) qs.set("title", title);
     if (artist) qs.set("artist", artist);
+    if (force) qs.set("force", "1");
     const tail = qs.toString() ? `?${qs}` : "";
     return req<LyricsResponse>(`/api/songs/${video_id}/lyrics${tail}`);
   },

@@ -94,7 +94,7 @@ export default function PhonePage() {
   }
 
   async function removeSong(item: QueueItem) {
-    if (item.nickname !== confirmedNick) return;
+    if (!isMine(item)) return;
     if (!confirm(`移除 "${item.title}"?`)) return;
     try {
       await api.removeQueueItem(roomId, item.id);
@@ -107,8 +107,16 @@ export default function PhonePage() {
     wsRef.current?.send(`atmosphere.${kind}`, { from: confirmedNick, ts: Date.now() });
   }
 
+  // Stable user_id ownership check; falls back to nickname only when either side lacks an id.
+  function isMine(item: QueueItem): boolean {
+    const myId = getIdentity()?.user_id;
+    if (myId && item.user_id) return item.user_id === myId;
+    return item.nickname === confirmedNick;
+  }
+
   const myCount = useMemo(
-    () => queue.filter((x) => x.nickname === confirmedNick && x.status !== "done").length,
+    () => queue.filter((x) => x.status !== "done" && isMine(x)).length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [queue, confirmedNick],
   );
 
@@ -247,7 +255,7 @@ export default function PhonePage() {
                     )}
                   </div>
                 </div>
-                {it.nickname === confirmedNick && it.status !== "playing" && (
+                {isMine(it) && it.status !== "playing" && (
                   <button onClick={() => removeSong(it)} className="text-white/50 hover:text-ktv-accent text-xl px-2">
                     ✕
                   </button>

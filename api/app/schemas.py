@@ -97,3 +97,4 @@ class HealthResponse(BaseModel):
     version: str
     demucs_available: bool
     cuda_available: bool
+    simple_vocal_removal_available: bool = False
