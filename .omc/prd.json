@@ -1,0 +1,220 @@
+{
+  "project": "KTV Box - Personal Learning Demo",
+  "description": "Single-shop commercial KTV box simulation. Phone QR ordering, YouTube real-time streaming (no ads), dual-mode original/instrumental playback, Demucs vocal removal, lyrics sync, multi-room, virtual billing timer, atmosphere animations. Local LAN only. Personal learning / Demo. Copyright OUT of scope.",
+  "scope": {
+    "in": [
+      "Next.js 14 App Router phone UI (zh-TW only)",
+      "Next.js 14 App Router big-screen TV UI",
+      "FastAPI backend with WebSocket per-room channels",
+      "SQLite storage (rooms, queue, songs, sessions, jobs)",
+      "yt-dlp integration: search, stream URL extraction, subtitle fetch, MP4 cache",
+      "LRCLIB.net lyrics fallback",
+      "Demucs htdemucs GPU vocal removal pipeline (cached)",
+      "Dual-mode playback: original | muted-video + instrumental audio",
+      "Queue management: add, reorder, insert next, remove, fair rotation by user",
+      "Multi-user nicknames (localStorage) per room",
+      "Walking-word lyrics + atmosphere animations (clap/confetti/fireworks/birthday)",
+      "Per-room timer with virtual billing",
+      "Multi-room (2-3 simultaneously)",
+      "docker-compose.yml for one-command startup",
+      "Comprehensive README with cookies.txt workflow + manual QA checklist"
+    ],
+    "out": [
+      "Real copyright licensing (MUST/MCAT/ARCO/RPAT)",
+      "Multi-tenancy / multi-shop",
+      "i18n framework (zh-TW only)",
+      "Pitch shift",
+      "User accounts / authentication",
+      "Production deployment / hardening"
+    ]
+  },
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Repo skeleton + dev tooling",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "C:\\Users\\xingceo\\Desktop\\KTV has api/, web/, data/, scripts/, .omc/, docker-compose.yml, README.md, .gitignore at root",
+        "api/ contains pyproject.toml or requirements.txt + main.py + tests/",
+        "web/ contains package.json + tsconfig.json + next.config.js + app/ + tests/",
+        "docker-compose.yml defines api and web services with healthchecks",
+        "README documents prerequisites, install steps, and one-command start"
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "FastAPI core + SQLite schema",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "api/db.py creates SQLite tables: rooms, users, queue_items, songs, jobs, sessions",
+        "api/main.py exposes /healthz returning 200 with JSON {status:'ok'}",
+        "api/main.py exposes /api/rooms (POST create, GET list, GET /{id})",
+        "api/main.py exposes /api/rooms/{id}/queue (GET list, POST add, DELETE /{item_id}, PATCH reorder)",
+        "pytest api/tests/test_health.py passes",
+        "pytest api/tests/test_rooms.py passes (create + list + get)",
+        "pytest api/tests/test_queue.py passes (add + list + remove + reorder)"
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "WebSocket per-room broadcast",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "WS endpoint /ws/rooms/{room_id} accepts connections",
+        "Connection manager broadcasts queue events only to subscribers of same room_id",
+        "Events: queue.added, queue.removed, queue.reordered, playback.state, vocal_removal.ready, room.timer.tick",
+        "pytest api/tests/test_ws.py passes (connect + receive + isolation between rooms)"
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "yt-dlp integration: search, stream URL, subtitles",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "api/services/youtube.py search(query, n) returns list of {id,title,duration,channel,thumbnail,view_count}",
+        "api/services/youtube.py get_stream(video_id) returns {video_url, audio_url, expires_at, vtt_path|None}",
+        "Cookies file at data/cookies.txt is honored if present",
+        "Rate limit: minimum 2s between yt-dlp calls (token bucket or simple sleep)",
+        "Stream URL refresh logic: refresh when remaining < 10 minutes",
+        "MP4 download cached to data/videos/{video_id}.mp4 with LRU cleanup",
+        "Subtitles cached to data/subs/{video_id}.vtt",
+        "pytest api/tests/test_youtube.py passes with mocked yt-dlp output"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Demucs vocal removal pipeline",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "api/services/demucs_worker.py exposes enqueue_vocal_removal(video_id) -> job_id",
+        "Worker runs htdemucs on GPU (CUDA detected) or falls back to CPU with warning",
+        "Output instrumental track saved to data/instrumentals/{video_id}.mp3",
+        "Job status tracked in jobs table: pending, running, done, failed",
+        "On completion, broadcasts vocal_removal.ready event over WS to room_id that requested",
+        "pytest api/tests/test_demucs_worker.py passes with mocked subprocess",
+        "README documents the GPU detection, expected time, and CPU fallback caveat"
+      ]
+    },
+    {
+      "id": "US-006",
+      "title": "LRCLIB lyrics fallback",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "api/services/lyrics.py fetch_lyrics(title, artist) tries LRCLIB.net /api/get",
+        "Returns parsed LRC time-stamped lyrics list[{time:float, text:str}] or None",
+        "Falls back to plain title/artist if no synced lyrics found",
+        "Cached to data/lyrics/{hash}.json",
+        "pytest api/tests/test_lyrics.py passes with mocked HTTP"
+      ]
+    },
+    {
+      "id": "US-007",
+      "title": "Web shared lib + room/session API client",
+      "priority": 7,
+      "passes": true,
+      "acceptanceCriteria": [
+        "web/lib/api.ts exports typed functions: createRoom, getRoom, addToQueue, removeFromQueue, reorderQueue, search",
+        "web/lib/ws.ts exports useRoomSocket(roomId) hook with auto-reconnect",
+        "web/lib/identity.ts exports getOrCreateNickname() backed by localStorage",
+        "web/lib/qr.ts exports generateRoomUrl(roomId) and getLanIp() helper",
+        "vitest passes for api.ts, identity.ts, qr.ts (with mocked fetch)"
+      ]
+    },
+    {
+      "id": "US-008",
+      "title": "Phone UI: enter room, search, request song",
+      "priority": 8,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Route /m/[roomId] renders phone-optimized UI in zh-TW",
+        "First visit prompts for nickname (modal), persists to localStorage",
+        "Search bar with debounced YouTube search, results show thumbnail/title/channel/duration",
+        "Tap result -> Add to queue button -> POST /api/rooms/{id}/queue",
+        "Visible queue list with current playing + position, your songs highlighted",
+        "Long-press / button to remove your own song",
+        "Toggle: 原曲 / 去人聲 (sets vocal_mode on queue item)",
+        "Responsive layout works on 375x667 viewport (vitest snapshot or playwright responsive check)"
+      ]
+    },
+    {
+      "id": "US-009",
+      "title": "Big screen UI: player, lyrics, animations",
+      "priority": 9,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Route /tv/[roomId] renders fullscreen black layout with QR code overlay (closeable)",
+        "One-time 'Click to start room' unlock button to satisfy autoplay-with-sound policy",
+        "HTML5 <video> element streams from yt-dlp stream URL, muted with parallel <audio> if vocal_mode='instrumental'",
+        "Walking-word lyrics overlay synced to currentTime",
+        "Atmosphere animations triggered: clap (manual button on phone), confetti (song end), fireworks (high score idle), birthday (manual)",
+        "Per-room timer in corner showing elapsed time + virtual cost (NT$X/min)",
+        "Auto-advance to next song on ended event",
+        "WS-driven queue updates without reload"
+      ]
+    },
+    {
+      "id": "US-010",
+      "title": "Atmosphere animation library",
+      "priority": 10,
+      "passes": true,
+      "acceptanceCriteria": [
+        "web/components/atmosphere/{Confetti,Fireworks,Clap,Birthday}.tsx implemented with Framer Motion or canvas",
+        "Each accepts a trigger prop and animates for fixed duration",
+        "Component snapshot tests pass under vitest"
+      ]
+    },
+    {
+      "id": "US-011",
+      "title": "Backend test suite + ASGI test client coverage",
+      "priority": 11,
+      "passes": true,
+      "acceptanceCriteria": [
+        "All api/tests/ files pass via `pytest -q` with exit code 0",
+        "Coverage: rooms, queue, ws, youtube (mocked), demucs (mocked), lyrics (mocked)",
+        "No deleted/skipped tests"
+      ]
+    },
+    {
+      "id": "US-012",
+      "title": "Frontend test suite + lint + typecheck",
+      "priority": 12,
+      "passes": true,
+      "acceptanceCriteria": [
+        "`npm test` (vitest) passes with exit code 0 in web/",
+        "`npm run typecheck` (tsc --noEmit) passes with 0 errors",
+        "`npm run lint` passes (eslint or biome)",
+        "Playwright config present at web/playwright.config.ts (smoke test optional, not required to actually run)"
+      ]
+    },
+    {
+      "id": "US-013",
+      "title": "docker-compose.yml + run scripts",
+      "priority": 13,
+      "passes": true,
+      "acceptanceCriteria": [
+        "docker-compose.yml has api (FastAPI w/ uvicorn) + web (Next.js prod) + healthchecks",
+        "GPU passthrough configured for api service when available (commented config)",
+        "Volumes: ./data:/app/data, ./api:/app/api (dev), web build artifacts",
+        "scripts/dev.ps1 starts both api (uvicorn --reload) and web (next dev) locally",
+        "scripts/lan-ip.ps1 prints LAN IP for QR code"
+      ]
+    },
+    {
+      "id": "US-014",
+      "title": "README + manual QA handoff document",
+      "priority": 14,
+      "passes": true,
+      "acceptanceCriteria": [
+        "README.md sections: Overview, Prerequisites, Quick Start, Architecture diagram (ASCII), Cookies workflow, Manual QA checklist, Known limitations",
+        "Manual QA checklist enumerates: phone QR scan, multi-user nickname, search & add, original playback, vocal removal toggle, instrumental playback, queue reorder, multi-room isolation, atmosphere animations, billing timer accuracy",
+        "Known limitations explicitly state: copyright OOS, GPU/Python version notes, autoplay unlock, A/V sync drift expected, 6h URL expiry"
+      ]
+    }
+  ]
+}

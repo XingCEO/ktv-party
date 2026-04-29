@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    @apply bg-ktv-bg text-white antialiased;
+    font-family: 'Noto Sans TC', system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    overscroll-behavior-y: contain;
+  }
+  button {
+    @apply select-none;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-ktv-panel/90 backdrop-blur rounded-2xl border border-white/5 shadow-xl;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center px-4 py-2 rounded-xl font-semibold transition-colors;
+  }
+  .btn-primary {
+    @apply btn bg-ktv-accent text-white hover:bg-ktv-accent/90 active:bg-ktv-accent/80;
+  }
+  .btn-ghost {
+    @apply btn bg-white/5 text-white/90 hover:bg-white/10;
+  }
+  .pill {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+}
+
+/* Karaoke lyric line - the "active" line gets a gold sweep */
+.lyric-line {
+  @apply text-3xl md:text-5xl font-bold tracking-wide opacity-50 transition-all;
+}
+.lyric-line.active {
+  @apply opacity-100 text-ktv-gold scale-105;
+  text-shadow: 0 0 24px rgba(255, 209, 102, 0.55);
+}

@@ -1,0 +1,5 @@
+# Optional: install only if you have a working Python 3.11/3.12 venv with CUDA PyTorch
+# Install order:
+#   1. torch+cu121: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   2. then: pip install -r requirements-demucs.txt
+demucs>=4.0.1

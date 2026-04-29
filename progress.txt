@@ -1,0 +1,59 @@
+# KTV Box - Progress Log
+
+## 2026-04-28 (Iteration 1) - COMPLETE
+
+### Environment
+- Node v24.13.0, npm 11.6.2
+- Python 3.14.3 (Demucs/PyTorch CUDA needs separate 3.12 venv - documented)
+- Docker 29.4.0
+- NVIDIA Driver 595.79, CUDA 13.2
+- yt-dlp 2026.3.17 installed via pip --user
+- ffmpeg: imageio-ffmpeg fallback (real ffmpeg optional)
+
+### Architecture decisions
+- Monorepo: api/ (FastAPI) + web/ (Next.js 14 App Router)
+- SQLite for storage (single-shop, single-process)
+- WebSocket per-room broker with snapshot on connect + atmosphere echo
+- yt-dlp invoked via subprocess with async rate limit (2s)
+- Demucs via subprocess `python -m demucs --two-stems vocals -n htdemucs`
+- Cookies.txt at data/cookies.txt (user-supplied)
+- Stream URLs cached in DB with expires_at; refresh threshold 600s
+- Identity = localStorage nickname + uuid (no auth)
+- Tailwind palette: bg #0a0a0f, panel #15151f, accent #ff4d8d, gold #ffd166, mic #06d6a0
+
+### Deliverables
+- Backend: 12 modules (config/db/schemas/rooms/queue/ws/main + services x4 + tests x8)
+- Frontend: lib/* (api/ws/identity/qr/cn) + app/{layout,globals,page,m/[roomId],tv/[roomId]} + components/atmosphere/{Atmosphere,FloatingEmoji}
+- Docker: api/Dockerfile, web/Dockerfile, docker-compose.yml
+- Scripts: dev.ps1, lan-ip.ps1
+- README.md (zh-TW, full setup + manual QA checklist)
+- Tests:
+  - Backend pytest: 26/26 PASS in 3.42s
+  - Frontend vitest: 16/16 PASS in 3.54s
+  - typecheck: clean
+  - next build: clean (3 react-hooks warnings on TV page; non-blocking)
+
+### Stories status
+All 14 PRD stories implemented; agent-verifiable acceptance criteria met.
+Manual QA items (real YouTube fetch, Demucs E2E, phone WiFi flow) flagged in README.
+
+### Known constraints accepted (per user direction)
+- Demucs vocal removal cannot be E2E tested in agent context (mocked unit tests + manual QA)
+- YouTube real streaming requires user's cookies.txt
+- Phone QR + multi-device flow requires user manual verification
+- Demucs torch wheels not available on Python 3.14 yet
+
+### Files added/modified summary
+api/app/{config,db,schemas,rooms,queue,ws,main}.py
+api/app/services/{youtube,lyrics,demucs_worker,__init__}.py
+api/tests/{conftest,test_health,test_rooms,test_queue,test_youtube,test_lyrics,test_demucs_worker,test_ws}.py
+api/{requirements.txt,Dockerfile}
+web/lib/{api,ws,identity,qr,cn}.ts
+web/app/{globals.css,layout.tsx,page.tsx,m/[roomId]/page.tsx,tv/[roomId]/page.tsx}
+web/components/atmosphere/{Atmosphere,FloatingEmoji}.tsx
+web/tests/{api,identity,ws,qr,cn}.test.ts
+web/Dockerfile
+docker-compose.yml
+scripts/{dev,lan-ip}.ps1
+README.md
+.omc/prd.json (updated)

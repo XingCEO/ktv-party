@@ -1,0 +1,67 @@
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.eggs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data (DO NOT COMMIT)
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+data/videos/
+data/instrumentals/
+data/subs/
+data/lyrics/
+data/cookies.txt
+!data/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# OMC state
+.omc/state/
+.omc/logs/
+.omc/research/
