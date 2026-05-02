@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS queue_items (
     position INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued', -- queued|playing|done|skipped
     added_at REAL NOT NULL,
+    started_at REAL,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
     FOREIGN KEY (video_id) REFERENCES songs(video_id)
 );
@@ -98,6 +99,11 @@ def get_conn() -> sqlite3.Connection:
     settings = get_settings()
     with _LOCK:
         if _CONN is None or _CONN_PATH != settings.db_path:
+            if _CONN is not None:
+                try:
+                    _CONN.close()
+                except Exception:
+                    pass
             _CONN = _connect(settings.db_path)
             _CONN.executescript(_SCHEMA)
             _CONN_PATH = settings.db_path
@@ -134,3 +140,7 @@ def init_db() -> None:
     """Idempotent init for explicit startup call."""
     conn = get_conn()
     conn.executescript(_SCHEMA)
+    try:
+        conn.execute("ALTER TABLE queue_items ADD COLUMN started_at REAL")
+    except sqlite3.OperationalError:
+        pass  # Column already exists

@@ -116,7 +116,7 @@ _WORKER_TASK: asyncio.Task | None = None
 def _ensure_queue() -> asyncio.Queue:
     global _QUEUE
     if _QUEUE is None:
-        _QUEUE = asyncio.Queue()
+        _QUEUE = asyncio.Queue(maxsize=64)
     return _QUEUE
 
 
@@ -193,11 +193,18 @@ async def _process_job(
 async def _worker_loop() -> None:
     q = _ensure_queue()
     while True:
-        job_id, video_id, input_path, on_complete = await q.get()
         try:
-            await _process_job(job_id, video_id, input_path, on_complete)
-        finally:
-            q.task_done()
+            while True:
+                job_id, video_id, input_path, on_complete = await q.get()
+                try:
+                    await _process_job(job_id, video_id, input_path, on_complete)
+                except Exception:
+                    logger.exception("_worker_loop: unexpected error processing job %s", job_id)
+                finally:
+                    q.task_done()
+        except Exception:
+            logger.exception("_worker_loop: fatal error, restarting loop in 1s")
+            await asyncio.sleep(1.0)
 
 
 def start_worker(loop: asyncio.AbstractEventLoop | None = None) -> None:
@@ -208,16 +215,81 @@ def start_worker(loop: asyncio.AbstractEventLoop | None = None) -> None:
     _WORKER_TASK = asyncio.create_task(_worker_loop())
 
 
+async def rehydrate_pending_jobs() -> None:
+    """On startup, re-enqueue any jobs that were 'pending' or 'running' when
+    the server died. Idempotent — safe to call multiple times."""
+    from ..db import get_conn, transaction
+    rows = get_conn().execute(
+        "SELECT id, payload FROM jobs WHERE kind='vocal_removal' AND status IN ('pending','running')"
+    ).fetchall()
+    if not rows:
+        return
+    logger.info("rehydrating %d Demucs jobs from previous run", len(rows))
+    q = _ensure_queue()
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"])
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("skipping unrehydrateable job %s", r["id"])
+            continue
+        video_id = payload.get("video_id")
+        # In our enqueue, it's called 'input', but the prompt uses 'input_path' string payload.get("input_path").
+        # I'll check what enqueue does: {"video_id": video_id, "input": str(input_path)}
+        # Wait, the prompt says `input_path_str = payload.get("input_path")` but the existing code uses "input".
+        # Let me use `payload.get("input_path") or payload.get("input")` to be safe and follow the prompt but be robust.
+        input_path_str = payload.get("input_path") or payload.get("input")
+        if not video_id or not input_path_str:
+            continue
+        input_path = Path(input_path_str)
+        if not input_path.exists():
+            # Source file missing — mark failed.
+            with transaction() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='failed', error='source missing on rehydrate', updated_at=? WHERE id=?",
+                    (time.time(), r["id"]),
+                )
+            continue
+        # Reset to pending and re-enqueue. on_complete is None — the original
+        # callback was a closure on the prior process and is gone.
+        with transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='pending', error=NULL, updated_at=? WHERE id=?",
+                (time.time(), r["id"]),
+            )
+        try:
+            q.put_nowait((r["id"], video_id, input_path, None))
+        except asyncio.QueueFull:
+            logger.warning("queue full during rehydrate; deferring job %s", r["id"])
+            with transaction() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='pending', updated_at=? WHERE id=?",
+                    (time.time(), r["id"]),
+                )
+
+
+def _ensure_worker_alive() -> None:
+    """Respawn worker if it died, to ensure queue items are processed."""
+    global _WORKER_TASK
+    if _WORKER_TASK is None or _WORKER_TASK.done():
+        logger.warning("demucs worker task is dead or missing, respawning")
+        start_worker()
+
 async def enqueue(
     video_id: str,
     input_path: Path,
     on_complete: Callable[[str, JobStatus], Awaitable[None]] | None = None,
 ) -> str:
+    _ensure_worker_alive()
+    q = _ensure_queue()
+    if q.full():
+        raise RuntimeError("vocal-removal queue full")
+        
     job_id = uuid.uuid4().hex[:12]
     _job_record(job_id, "vocal_removal", {"video_id": video_id, "input": str(input_path)})
     _song_update_instrumental(video_id, "pending")
-    q = _ensure_queue()
-    await q.put((job_id, video_id, input_path, on_complete))
+    
+    # We already checked full(), but use put_nowait to be safe
+    q.put_nowait((job_id, video_id, input_path, on_complete))
     return job_id
 
 

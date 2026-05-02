@@ -60,6 +60,7 @@ class QueueItem(BaseModel):
     position: int
     status: Literal["queued", "playing", "done", "skipped"]
     added_at: float
+    started_at: Optional[float] = None
 
 
 class QueueReorder(BaseModel):

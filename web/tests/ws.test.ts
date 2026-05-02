@@ -113,4 +113,57 @@ describe("RoomSocket", () => {
     expect(h).not.toHaveBeenCalled();
     sock.close();
   });
+
+  it("pong with ts -> latency stored", () => {
+    const sock = new RoomSocket("r", "ws://x");
+    const stateHandler = vi.fn();
+    sock.onState(stateHandler);
+    sock.connect();
+    
+    const fake = FakeWS.instances[0]!;
+    fake.open();
+    
+    const ts = Date.now() - 50; // simulated 50ms ago
+    fake.emit({ event: "pong", data: { ts } });
+    
+    expect(stateHandler).toHaveBeenLastCalledWith("open", 50);
+    sock.close();
+  });
+
+  it("state callback emits 'open' / 'reconnecting' / 'open'", () => {
+    const sock = new RoomSocket("r", "ws://x");
+    const stateHandler = vi.fn();
+    sock.onState(stateHandler);
+    
+    sock.connect();
+    expect(stateHandler).toHaveBeenCalledWith("connecting", null);
+    
+    const fake1 = FakeWS.instances[0]!;
+    fake1.open();
+    expect(stateHandler).toHaveBeenCalledWith("open", null);
+    
+    fake1.close();
+    expect(stateHandler).toHaveBeenCalledWith("reconnecting", null);
+    
+    vi.advanceTimersByTime(1500); // Reconnect
+    const fake2 = FakeWS.instances[1]!;
+    fake2.open();
+    expect(stateHandler).toHaveBeenCalledWith("open", null);
+    
+    sock.close();
+  });
+
+  it("jitter: reconnect interval is within ±15% of baseline", () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const sock = new RoomSocket("r", "ws://x");
+    sock.connect();
+    const fake = FakeWS.instances[0]!;
+    fake.close(); // Triggers scheduleReconnect
+
+    // baseline 1000
+    const delay = setTimeoutSpy.mock.calls[0][1] as number;
+    expect(delay).toBeGreaterThanOrEqual(850);
+    expect(delay).toBeLessThanOrEqual(1150);
+    sock.close();
+  });
 });

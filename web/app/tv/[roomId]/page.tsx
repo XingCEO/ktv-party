@@ -122,13 +122,19 @@ export default function TvPage() {
   // via timeupdate, since timeupdate only fires ~4Hz on most browsers.)
   useEffect(() => {
     const v = videoRef.current;
-    if (!v || !stream) return;
-    const onEnded = async () => {
-      await api.playbackNext(roomId).catch(console.error);
+      if (!v || !stream) return;
+    const itemId = playing?.id;
+    const onEnded = () => {
+      // Server is the source of truth for advancement (services/scheduler.py).
+      // We just send a fast-path hint via WS — the server validates it (>=30s
+      // playing) and decides whether to advance. This way, a TV refresh /
+      // browser crash never blocks the queue: the server scheduler advances
+      // overdue songs even without a healthy TV.
+      wsRef.current?.send("playback.endHint", { item_id: itemId });
     };
     v.addEventListener("ended", onEnded);
     return () => v.removeEventListener("ended", onEnded);
-  }, [stream, roomId]);
+    }, [stream, roomId, playing?.id]);
 
   // Drive video src imperatively so re-fetched stream URLs (mid-song refresh)
   // can keep currentTime instead of yanking the singer back to t=0.

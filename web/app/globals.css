@@ -3,6 +3,12 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    --gradient-stage: radial-gradient(ellipse at top, #1a1a2e 0%, #0a0a0f 70%);
+    --gradient-panel: linear-gradient(180deg, rgba(21, 21, 31, 0.95) 0%, rgba(15, 15, 20, 0.95) 100%);
+    --gradient-pink-gold: linear-gradient(135deg, #ff4d8d, #ffd166);
+  }
+
   html, body {
     @apply bg-ktv-bg text-white antialiased;
     font-family: 'Noto Sans TC', system-ui, sans-serif;
@@ -14,29 +20,66 @@
   button {
     @apply select-none;
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Scrollbar for Chromium */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
 }
 
 @layer components {
   .panel {
-    @apply bg-ktv-panel/90 backdrop-blur rounded-2xl border border-white/5 shadow-xl;
+    @apply bg-ktv-panel/90 backdrop-blur rounded-2xl border border-white/10 shadow-xl;
+    background-image: var(--gradient-panel);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 32px rgba(0, 0, 0, 0.4);
   }
+  
+  .glass {
+    @apply bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
   .btn {
-    @apply inline-flex items-center justify-center px-4 py-2 rounded-xl font-semibold transition-colors;
+    @apply inline-flex items-center justify-center px-4 py-2 rounded-xl font-semibold transition-all duration-200 active:scale-[0.97];
   }
+  
   .btn-primary {
-    @apply btn bg-ktv-accent text-white hover:bg-ktv-accent/90 active:bg-ktv-accent/80;
+    @apply btn text-white shadow-lg shadow-ktv-accent/20 hover:shadow-ktv-accent/40;
+    background: linear-gradient(135deg, #ff4d8d, #e0336e);
   }
+  
   .btn-ghost {
-    @apply btn bg-white/5 text-white/90 hover:bg-white/10;
+    @apply btn bg-white/5 text-white/90 hover:bg-white/10 active:bg-white/5;
   }
+  
   .pill {
-    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium;
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-white/10 border border-white/5;
   }
 }
 
 /* Karaoke lyric line - the "active" line gets a gold sweep */
 .lyric-line {
-  @apply text-3xl md:text-5xl font-bold tracking-wide opacity-50 transition-all;
+  @apply text-3xl md:text-5xl font-bold tracking-wide opacity-50 transition-all duration-300;
 }
 .lyric-line.active {
   @apply opacity-100 text-ktv-gold scale-105;

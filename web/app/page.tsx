@@ -2,94 +2,173 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, type Room } from "@/lib/api";
+import { Button } from "@/components/ui/Button";
+import { Card, CardBody } from "@/components/ui/Card";
+import { Input } from "@/components/ui/Input";
+import { Badge } from "@/components/ui/Badge";
+import { ToastProvider, useToast } from "@/components/ui/Toast";
 
-export default function HomePage() {
+function HomePageContent() {
   const [rooms, setRooms] = useState<Room[]>([]);
-  const [name, setName] = useState("包廂A");
+  const [name, setName] = useState("");
   const [rate, setRate] = useState(8);
-  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const toast = useToast();
 
   async function load() {
     try {
       setRooms(await api.listRooms());
     } catch (e: any) {
-      setErr(e.message);
+      toast({ variant: "error", message: e.message || "載入包廂失敗" });
     }
   }
 
   useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function create() {
-    setErr(null);
+    if (!name.trim()) {
+      toast({ variant: "warning", message: "請輸入包廂名稱" });
+      return;
+    }
+    setCreating(true);
     try {
       await api.createRoom(name, rate);
       setName("");
-      load();
+      setRate(8);
+      toast({ variant: "success", message: "建立包廂成功！" });
+      await load();
     } catch (e: any) {
-      setErr(e.message);
+      toast({ variant: "error", message: e.message || "建立包廂失敗" });
+    } finally {
+      setCreating(false);
     }
   }
 
   return (
-    <main className="min-h-screen p-8 max-w-3xl mx-auto">
-      <h1 className="text-4xl font-extrabold mb-2 text-ktv-gold">KTV Box</h1>
-      <p className="text-white/60 mb-8">個人學習 / Demo - 區網點唱系統</p>
-
-      <section className="panel p-6 mb-8">
-        <h2 className="text-xl font-bold mb-4">建立新包廂</h2>
-        <div className="flex gap-2 flex-wrap">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="包廂名稱"
-            className="flex-1 min-w-[180px] px-3 py-2 rounded-lg bg-white/5 border border-white/10"
-          />
-          <input
-            type="number"
-            value={rate}
-            onChange={(e) => setRate(Number(e.target.value))}
-            className="w-32 px-3 py-2 rounded-lg bg-white/5 border border-white/10"
-            placeholder="元/分鐘"
-          />
-          <button onClick={create} className="btn-primary">
-            建立
-          </button>
+    <main className="min-h-screen bg-ktv-bg flex flex-col text-white pb-safe-bottom">
+      {/* Hero Section */}
+      <section className="relative w-full pt-16 pb-12 px-6 flex flex-col items-center justify-center overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-b from-ktv-accent/10 to-transparent pointer-events-none" />
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-pink-gold opacity-20 blur-[120px] rounded-full pointer-events-none" />
+        <div className="z-10 text-center animate-fade-up">
+          <Badge variant="gold" className="mb-6 mx-auto px-3 py-1">
+            v1.0 Demo
+          </Badge>
+          <h1 className="text-6xl md:text-7xl font-extrabold tracking-tight mb-4 drop-shadow-lg text-transparent bg-clip-text bg-gradient-to-br from-white via-white to-ktv-gold">
+            🎤 KTV Box
+          </h1>
+          <p className="text-xl md:text-2xl text-white/70 font-medium mb-2">
+            在家就是 KTV 包廂
+          </p>
+          <p className="text-sm text-white/50 max-w-md mx-auto">
+            筆電接電視，手機當遙控器。<br />
+            點歌、切伴奏、發特效，無需昂貴設備即可歡唱。
+          </p>
         </div>
-        {err && <p className="text-ktv-accent mt-2 text-sm">{err}</p>}
       </section>
 
-      <section className="panel p-6">
-        <h2 className="text-xl font-bold mb-4">現有包廂</h2>
-        {rooms.length === 0 ? (
-          <p className="text-white/50">目前沒有包廂,請先建立。</p>
-        ) : (
-          <ul className="space-y-3">
-            {rooms.map((r) => (
-              <li
-                key={r.id}
-                className="flex items-center justify-between bg-white/5 rounded-xl px-4 py-3"
-              >
-                <div>
-                  <div className="font-bold text-lg">{r.name}</div>
-                  <div className="text-xs text-white/50">
-                    ID: {r.id} · {r.rate_per_minute} 元/分
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Link href={`/tv/${r.id}`} className="btn-ghost">
-                    TV 大螢幕
-                  </Link>
-                  <Link href={`/m/${r.id}`} className="btn-primary">
-                    手機點歌
-                  </Link>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
+      {/* Main Content */}
+      <section className="flex-1 w-full max-w-4xl mx-auto px-6 flex flex-col gap-10 pb-16 z-10">
+        
+        {/* Create Room */}
+        <Card glow className="bg-panel border-white/5 shadow-2xl relative overflow-hidden group">
+          <div className="absolute top-0 right-0 p-32 bg-ktv-accent/5 rounded-full blur-3xl -z-10 group-hover:bg-ktv-accent/10 transition-colors duration-500" />
+          <CardBody className="p-6 md:p-8 flex flex-col md:flex-row gap-4 items-end">
+            <div className="w-full flex-1">
+              <label className="block text-sm font-bold text-white/80 mb-2">建立新包廂</label>
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="例如: 週末狂歡夜"
+                className="w-full bg-white/5 border-white/10 focus:border-ktv-accent"
+              />
+            </div>
+            <div className="w-full md:w-32">
+              <label className="block text-sm font-bold text-white/80 mb-2">費率</label>
+              <Input
+                type="number"
+                value={rate}
+                onChange={(e) => setRate(Number(e.target.value))}
+                placeholder="8"
+                rightAddon="$/分"
+                className="w-full bg-white/5 border-white/10 focus:border-ktv-accent"
+              />
+            </div>
+            <Button
+              size="lg"
+              variant="primary"
+              className="w-full md:w-auto mt-4 md:mt-0 whitespace-nowrap"
+              onClick={create}
+              loading={creating}
+            >
+              建立包廂
+            </Button>
+          </CardBody>
+        </Card>
+
+        {/* Existing Rooms */}
+        <div className="flex flex-col gap-4">
+          <h2 className="text-2xl font-bold flex items-center gap-3">
+            現有包廂
+            <Badge variant="outline" className="text-white/60 border-white/20">{rooms.length}</Badge>
+          </h2>
+
+          {rooms.length === 0 ? (
+            <div className="py-16 text-center border-2 border-dashed border-white/10 rounded-3xl bg-white/5">
+              <div className="text-6xl mb-4 opacity-80">🛋️</div>
+              <h3 className="text-xl font-bold mb-2">目前沒有包廂</h3>
+              <p className="text-white/50 mb-6">點擊上方按鈕建立第一間包廂</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {rooms.map((r) => (
+                <Card key={r.id} className="bg-panel border-white/5 hover:border-white/15 transition-all group overflow-hidden relative">
+                  <div className="absolute top-0 left-0 w-1 h-full bg-gradient-to-b from-ktv-gold to-ktv-accent opacity-50 group-hover:opacity-100 transition-opacity" />
+                  <CardBody className="p-5 flex flex-col gap-4">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <h3 className="text-xl font-bold text-ktv-gold mb-1 truncate pr-2" title={r.name}>{r.name}</h3>
+                        <div className="flex items-center gap-2">
+                          <Badge variant="default" className="bg-white/10 text-white/70 text-xs px-2 py-0.5">ID: {r.id}</Badge>
+                          <Badge variant="outline" className="border-ktv-mic/30 text-ktv-mic text-xs px-2 py-0.5">{r.rate_per_minute} 元/分</Badge>
+                        </div>
+                      </div>
+                    </div>
+                    
+                    <div className="flex flex-col gap-2 mt-2">
+                      <Button asChild variant="gold" size="md" className="w-full shadow-md">
+                        <Link href={`/tv/${r.id}`}>TV 大螢幕</Link>
+                      </Button>
+                      <Button asChild variant="primary" size="md" className="w-full">
+                        <Link href={`/m/${r.id}`}>📱 手機點歌</Link>
+                      </Button>
+                    </div>
+                  </CardBody>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+
       </section>
+
+      {/* Footer */}
+      <footer className="mt-auto py-8 text-center text-white/30 text-sm border-t border-white/5">
+        <p className="font-medium mb-1">KTV Box v1.0.0</p>
+        <p>僅供個人 / 教育用途。請勿用於商業營利。</p>
+      </footer>
     </main>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <ToastProvider>
+      <HomePageContent />
+    </ToastProvider>
   );
 }

@@ -1,6 +1,7 @@
 """Queue repository with fair-rotation ordering."""
 from __future__ import annotations
 
+import sqlite3
 import time
 from typing import Optional
 
@@ -22,6 +23,7 @@ def _row_to_item(r) -> QueueItem:
         position=r["position"],
         status=r["status"],
         added_at=r["added_at"],
+        started_at=r["started_at"] if "started_at" in r.keys() else None,
     )
 
 
@@ -71,17 +73,37 @@ def add_to_queue(room_id: str, payload: QueueAdd) -> QueueItem:
             (room_id,),
         ).fetchone()
         initial_status = "queued" if playing_row else "playing"
-        cur = conn.execute(
-            """INSERT INTO queue_items
-               (room_id, user_id, nickname, video_id, title, duration_sec,
-                thumbnail_url, vocal_mode, position, status, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                room_id, payload.user_id, payload.nickname, payload.video_id,
-                payload.title, payload.duration_sec, payload.thumbnail_url,
-                payload.vocal_mode, new_pos, initial_status, now,
-            ),
-        )
+        try:
+            cur = conn.execute(
+                """INSERT INTO queue_items
+                   (room_id, user_id, nickname, video_id, title, duration_sec,
+                    thumbnail_url, vocal_mode, position, status, added_at, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    room_id, payload.user_id, payload.nickname, payload.video_id,
+                    payload.title, payload.duration_sec, payload.thumbnail_url,
+                    payload.vocal_mode, new_pos, initial_status, now,
+                    now if initial_status == "playing" else None,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Concurrent insert already claimed 'playing' for this room; fall back to 'queued'.
+            max_pos_row2 = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) AS mp FROM queue_items WHERE room_id = ? AND status IN ('queued','playing')",
+                (room_id,),
+            ).fetchone()
+            new_pos = (max_pos_row2["mp"] or 0) + 1
+            cur = conn.execute(
+                """INSERT INTO queue_items
+                   (room_id, user_id, nickname, video_id, title, duration_sec,
+                    thumbnail_url, vocal_mode, position, status, added_at, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    room_id, payload.user_id, payload.nickname, payload.video_id,
+                    payload.title, payload.duration_sec, payload.thumbnail_url,
+                    payload.vocal_mode, new_pos, "queued", now, None,
+                ),
+            )
         item_id = cur.lastrowid
     # Apply fair rotation rebalance.
     apply_fair_rotation(room_id)
@@ -129,10 +151,11 @@ def apply_fair_rotation(room_id: str) -> None:
         ).fetchone()
         start = (playing["p"] or 0) + 1
         for offset, r in enumerate(interleaved):
-            conn.execute(
-                "UPDATE queue_items SET position = ? WHERE id = ?",
-                (start + offset, r["id"]),
-            )
+            if r["position"] != start + offset:
+                conn.execute(
+                    "UPDATE queue_items SET position = ? WHERE id = ?",
+                    (start + offset, r["id"]),
+                )
 
 
 def remove_item(room_id: str, item_id: int) -> bool:
@@ -149,6 +172,8 @@ def remove_item(room_id: str, item_id: int) -> bool:
 
 def reorder_queue(room_id: str, item_ids: list[int]) -> list[QueueItem]:
     """Set explicit positions in given order (overrides fair rotation for this call)."""
+    if len(item_ids) != len(set(item_ids)):
+        raise ValueError("duplicate ids")
     with transaction() as conn:
         rows = conn.execute(
             "SELECT id FROM queue_items WHERE room_id = ? AND status = 'queued'",
@@ -220,8 +245,8 @@ def advance_to_next(room_id: str) -> Optional[QueueItem]:
         if not row:
             return None
         conn.execute(
-            "UPDATE queue_items SET status = 'playing' WHERE id = ?",
-            (row["id"],),
+            "UPDATE queue_items SET status = 'playing', started_at = ? WHERE id = ?",
+            (time.time(), row["id"],),
         )
     return get_current_playing(room_id)
 
@@ -239,7 +264,7 @@ def start_first_if_idle(room_id: str) -> Optional[QueueItem]:
         if not row:
             return None
         conn.execute(
-            "UPDATE queue_items SET status = 'playing' WHERE id = ?",
-            (row["id"],),
+            "UPDATE queue_items SET status = 'playing', started_at = ? WHERE id = ?",
+            (time.time(), row["id"],),
         )
     return get_current_playing(room_id)

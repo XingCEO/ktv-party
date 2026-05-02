@@ -20,6 +20,11 @@ from . import youtube
 
 logger = logging.getLogger(__name__)
 
+from ._lock_cache import LockCache
+
+# Per-video-id locks to prevent concurrent ffmpeg runs for the same video.
+_KARAOKE_LOCKS = LockCache(maxsize=256)
+
 
 def _run_ffmpeg_sync(input_path: Path, output_path: Path) -> None:
     ffmpeg = youtube._ffmpeg_path()
@@ -51,11 +56,24 @@ def is_simple_available() -> bool:
 
 
 async def make_karaoke(video_id: str) -> Path:
-    """Produce data/instrumentals/{video_id}.mp3 via center-channel cancellation."""
+    """Produce data/instrumentals/{video_id}.mp3 via center-channel cancellation.
+
+    Raises ``LockCacheFullError`` if the per-video lock cache is full and
+    every entry is held — caller should treat as transient (HTTP 503) and
+    retry later. In normal operation this never triggers.
+    """
     settings = get_settings()
     out = settings.instrumentals_dir / f"{video_id}.mp3"
+    # Fast path: file already exists before acquiring any lock.
     if out.exists():
         return out
-    src = await youtube.download_mp4(video_id)
-    await asyncio.to_thread(_run_ffmpeg_sync, src, out)
+    # Acquire per-video lock so concurrent callers for the same video_id
+    # don't both invoke ffmpeg simultaneously.
+    lock = await _KARAOKE_LOCKS.get_lock(video_id)
+    async with lock:
+        # Re-check inside the lock: a concurrent caller may have finished by now.
+        if out.exists():
+            return out
+        src = await youtube.download_mp4(video_id)
+        await asyncio.to_thread(_run_ffmpeg_sync, src, out)
     return out

@@ -20,6 +20,7 @@ def test_add_and_list_queue(client):
     q = client.get(f"/api/rooms/{rid}/queue").json()
     assert len(q) == 1
     assert q[0]["status"] == "playing"
+    assert q[0].get("started_at") is not None
 
 
 def test_fair_rotation_interleave(client):
@@ -74,6 +75,21 @@ def test_reorder(client):
     out = [x["id"] for x in r.json() if x["status"] == "queued"]
     assert out == new_order
 
+def test_reorder_rejects_duplicate_ids(client):
+    rid = _mk_room(client)
+    _add(client, rid, "alice", "a1")
+    i2 = _add(client, rid, "alice", "a2")
+    i3 = _add(client, rid, "bob", "b1")
+    
+    queued = [x["id"] for x in client.get(f"/api/rooms/{rid}/queue").json()
+              if x["status"] == "queued"]
+    
+    # Duplicate an id
+    bad_order = [queued[0], queued[0]]
+    r = client.patch(f"/api/rooms/{rid}/queue", json={"item_ids": bad_order})
+    assert r.status_code == 400
+    assert "duplicate ids" in r.json()["detail"]
+
 
 def test_vocal_mode_update(client):
     rid = _mk_room(client)
@@ -113,3 +129,33 @@ def test_insert_next(client):
         key=lambda x: x["position"],
     )
     assert queued[0]["id"] == target["id"]
+
+
+def test_vocal_mode_broadcast_includes_queue(client):
+    rid = _mk_room(client)
+    with client.websocket_connect(f"/ws/rooms/{rid}") as ws:
+        _ = ws.receive_json()  # snapshot
+
+        # Add a song; consume the queue.added broadcast.
+        item = _add(client, rid, "alice", "v1")
+        evt = ws.receive_json()
+        assert evt["event"] == "queue.added"
+
+        # PATCH vocal-mode and capture the broadcast.
+        r = client.patch(
+            f"/api/rooms/{rid}/queue/{item['id']}/vocal-mode",
+            json={"vocal_mode": "instrumental"},
+        )
+        assert r.status_code == 204
+
+        evt2 = ws.receive_json()
+        assert evt2["event"] == "queue.vocal_mode.updated"
+        assert evt2["data"]["item_id"] == item["id"]
+        assert evt2["data"]["vocal_mode"] == "instrumental"
+        # The broadcast must include the full queue snapshot.
+        assert "queue" in evt2["data"]
+        q = evt2["data"]["queue"]
+        assert len(q) >= 1
+        target = next((x for x in q if x["id"] == item["id"]), None)
+        assert target is not None
+        assert target["vocal_mode"] == "instrumental"

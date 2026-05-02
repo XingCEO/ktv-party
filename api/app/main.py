@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,16 @@ from .schemas import (
     StreamInfo,
     VocalModeUpdate,
 )
-from .services import audio_simple, demucs_worker, lyrics, youtube
+from .services import audio_simple, demucs_worker, lyrics, youtube, scheduler
+from .services.youtube import (
+    YoutubeError,
+    YoutubeRateLimited,
+    YoutubeGeoBlocked,
+    YoutubeAgeRestricted,
+    YoutubePrivate,
+    YoutubeUnavailable,
+)
+from .services._lock_cache import LockCacheFullError
 from .ws import broker, safe_broadcast
 
 logger = logging.getLogger(__name__)
@@ -48,11 +58,50 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 VERSION = "0.1.0"
 
+# (kind, ts) tuples per room, last 4s only.
+_ATMOSPHERE_TRACKER: defaultdict[str, deque[tuple[str, float]]] = defaultdict(lambda: deque(maxlen=20))
+COMBO_THRESHOLD = 5
+COMBO_WINDOW_SEC = 4.0
+
+def _record_atmosphere_and_check_combo(room_id: str, kind: str) -> int | None:
+    """Returns combo count if threshold reached, else None."""
+    now = time.time()
+    tracker = _ATMOSPHERE_TRACKER[room_id]
+    tracker.append((kind, now))
+    # Count same-kind events within window
+    same_kind_recent = sum(
+        1 for k, t in tracker if k == kind and now - t <= COMBO_WINDOW_SEC
+    )
+    if same_kind_recent >= COMBO_THRESHOLD:
+        # Burn the tracker entries for this kind so we don't fire combo every time after threshold
+        tracker.clear()
+        return same_kind_recent
+    return None
+
+
+_BG_TASKS: set[asyncio.Task] = set()
+
+def _spawn_bg(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+async def _prune_ws_loop() -> None:
+    while True:
+        await asyncio.sleep(30.0)
+        try:
+            await broker.prune_stale()
+        except Exception as exc:
+            logger.exception("prune_stale loop error: %s", exc)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     demucs_worker.start_worker()
+    await demucs_worker.rehydrate_pending_jobs()
+    _spawn_bg(scheduler.scheduler_loop())
+    _spawn_bg(_prune_ws_loop())
     logger.info("ktv-api started; demucs_available=%s", demucs_worker.is_demucs_available())
     yield
     logger.info("ktv-api shutting down")
@@ -184,10 +233,10 @@ async def add_to_queue(room_id: str, payload: QueueAdd) -> QueueItem:
     if payload.vocal_mode == "instrumental" and (
         demucs_worker.is_demucs_available() or audio_simple.is_simple_available()
     ):
-        asyncio.create_task(_prewarm_instrumental(room_id, payload.video_id))
+        _spawn_bg(_prewarm_instrumental(room_id, payload.video_id))
     # Pre-warm lyrics so the TV doesn't pay 10-30s of lrclib RTT when the song
     # actually starts. Channel was just upserted into songs table by add_to_queue.
-    asyncio.create_task(_prewarm_lyrics(payload.video_id, payload.title, payload.channel))
+    _spawn_bg(_prewarm_lyrics(payload.video_id, payload.title, payload.channel))
     return item
 
 
@@ -273,6 +322,7 @@ async def update_vocal_mode(room_id: str, item_id: int, payload: VocalModeUpdate
         raise HTTPException(404, "queue item not found")
     await safe_broadcast(room_id, "queue.vocal_mode.updated", {
         "item_id": item_id, "vocal_mode": payload.vocal_mode,
+        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
     })
     # Mirror add_to_queue behavior — kick off vocal removal so the singer doesn't have
     # to wait when they actually press play. Toggling back to original is a no-op.
@@ -284,15 +334,24 @@ async def update_vocal_mode(room_id: str, item_id: int, payload: VocalModeUpdate
             None,
         )
         if row:
-            asyncio.create_task(_prewarm_instrumental(room_id, row.video_id))
+            _spawn_bg(_prewarm_instrumental(room_id, row.video_id))
 
 
 @app.post("/api/rooms/{room_id}/playback/next", response_model=Optional[QueueItem])
 async def playback_next(room_id: str) -> Optional[QueueItem]:
+    return await _advance_via_endpoint(room_id)
+
+async def _advance_via_endpoint(room_id: str) -> Optional[QueueItem]:
     item = queue_repo.advance_to_next(room_id)
+    full = queue_repo.list_queue(room_id)
+    next_starts_at = None
+    if item and item.duration_sec:
+        next_starts_at = time.time() + item.duration_sec
     await safe_broadcast(room_id, "playback.advanced", {
         "current": item.model_dump() if item else None,
-        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+        "queue": [i.model_dump() for i in full],
+        "next_starts_at": next_starts_at,
+        "reason": "endpoint",
     })
     return item
 
@@ -302,6 +361,14 @@ async def playback_next(room_id: str) -> Optional[QueueItem]:
 async def search(q: str = Query(..., min_length=1), n: int = Query(10, ge=1, le=25)) -> list[SearchResult]:
     try:
         hits = await youtube.search(q, n=n)
+    except YoutubeRateLimited as exc:
+        raise HTTPException(429, {"code": exc.code, "message": exc.user_message})
+    except (YoutubeGeoBlocked, YoutubeAgeRestricted, YoutubePrivate) as exc:
+        raise HTTPException(403, {"code": exc.code, "message": exc.user_message})
+    except YoutubeUnavailable as exc:
+        raise HTTPException(404, {"code": exc.code, "message": exc.user_message})
+    except YoutubeError as exc:
+        raise HTTPException(502, {"code": exc.code, "message": exc.user_message})
     except Exception as exc:
         raise HTTPException(502, f"search failed: {exc}")
     return [SearchResult(**h.__dict__) for h in hits]
@@ -311,6 +378,14 @@ async def search(q: str = Query(..., min_length=1), n: int = Query(10, ge=1, le=
 async def get_stream(video_id: str) -> StreamInfo:
     try:
         info = await youtube.get_stream(video_id)
+    except YoutubeRateLimited as exc:
+        raise HTTPException(429, {"code": exc.code, "message": exc.user_message})
+    except (YoutubeGeoBlocked, YoutubeAgeRestricted, YoutubePrivate) as exc:
+        raise HTTPException(403, {"code": exc.code, "message": exc.user_message})
+    except YoutubeUnavailable as exc:
+        raise HTTPException(404, {"code": exc.code, "message": exc.user_message})
+    except YoutubeError as exc:
+        raise HTTPException(502, {"code": exc.code, "message": exc.user_message})
     except Exception as exc:
         raise HTTPException(502, f"stream resolve failed: {exc}")
     instrumental = demucs_worker.find_existing_instrumental(video_id)
@@ -360,13 +435,30 @@ async def request_instrumental(video_id: str) -> dict:
     if demucs_worker.is_demucs_available():
         try:
             mp4 = await youtube.download_mp4(video_id)
+        except LockCacheFullError:
+            raise HTTPException(503, "download lock cache full, try again later")
+        except YoutubeRateLimited as exc:
+            raise HTTPException(429, {"code": exc.code, "message": exc.user_message})
+        except (YoutubeGeoBlocked, YoutubeAgeRestricted, YoutubePrivate) as exc:
+            raise HTTPException(403, {"code": exc.code, "message": exc.user_message})
+        except YoutubeUnavailable as exc:
+            raise HTTPException(404, {"code": exc.code, "message": exc.user_message})
+        except YoutubeError as exc:
+            raise HTTPException(502, {"code": exc.code, "message": exc.user_message})
         except Exception as exc:
             raise HTTPException(502, f"download failed: {exc}")
-        job_id = await demucs_worker.enqueue(video_id, mp4)
+        try:
+            job_id = await demucs_worker.enqueue(video_id, mp4)
+        except RuntimeError as exc:
+            if "queue full" in str(exc):
+                raise HTTPException(503, "vocal-removal queue is full, try again later")
+            raise HTTPException(502, f"demucs enqueue failed: {exc}")
         return {"status": "queued", "job_id": job_id, "video_id": video_id, "method": "demucs"}
     if audio_simple.is_simple_available():
         try:
             produced = await audio_simple.make_karaoke(video_id)
+        except LockCacheFullError:
+            raise HTTPException(503, "karaoke lock cache full, try again later")
         except Exception as exc:
             raise HTTPException(502, f"karaoke render failed: {exc}")
         return {"status": "done", "video_id": video_id, "path": str(produced), "method": "center_cancel"}
@@ -402,13 +494,15 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
         # Initial snapshot
         room = rooms_repo.get_room(room_id)
         if room:
+            current = queue_repo.get_current_playing(room_id)
             await ws.send_json({
                 "event": "room.snapshot",
                 "data": {
                     "room": room.model_dump(),
                     "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
-                    "current": (queue_repo.get_current_playing(room_id) or QueueItem.model_construct()).model_dump() if queue_repo.get_current_playing(room_id) else None,
+                    "current": current.model_dump() if current else None,
                     "timer": _compute_timer(room).model_dump(),
+                    "participants": broker.list_identities(room_id),
                 },
             })
         while True:
@@ -420,12 +514,38 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
                 "atmosphere.confetti", "atmosphere.fireworks",
                 "atmosphere.clap", "atmosphere.birthday",
             }:
-                await safe_broadcast(room_id, event, data)
+                await safe_broadcast(room_id, event, data, exclude=ws)
+                kind = event.split(".", 1)[1]
+                combo = _record_atmosphere_and_check_combo(room_id, kind)
+                if combo is not None:
+                    await safe_broadcast(room_id, "atmosphere.combo", {"kind": kind, "count": combo, "multiplier": min(combo // 5 + 1, 5)})
+            elif event == "identity":
+                await broker.set_identity(room_id, ws, data)
+                await safe_broadcast(room_id, "presence.updated", {
+                    "participants": broker.list_identities(room_id),
+                })
+                nick = data.get("nickname")
+                if nick:
+                    await safe_broadcast(room_id, "presence.joined", {"nickname": nick}, exclude=ws)
+            elif event == "playback.endHint":
+                current = queue_repo.get_current_playing(room_id)
+                if current and current.started_at and time.time() - current.started_at > 30:
+                    await _advance_via_endpoint(room_id)
             elif event == "ping":
-                await ws.send_json({"event": "pong", "data": {}})
+                # Echo back the ts so the client can compute round-trip latency.
+                # Anything else in `data` is preserved for forward-compat.
+                await ws.send_json({"event": "pong", "data": data})
+            elif event == "pong":
+                # Reply to a server-initiated heartbeat (server.ping). No action needed;
+                # the client just proves it's still alive.
+                pass
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         logger.warning("ws error room=%s: %s", room_id, exc)
     finally:
+        identity = broker._room_identities.get(room_id, {}).get(ws)
         await broker.disconnect(room_id, ws)
+        if identity:
+            await safe_broadcast(room_id, "presence.left", {"nickname": identity.get("nickname")})
+            await safe_broadcast(room_id, "presence.updated", {"participants": broker.list_identities(room_id)})

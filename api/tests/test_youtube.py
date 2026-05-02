@@ -1,4 +1,5 @@
 """Test yt-dlp service with subprocess mocked."""
+import asyncio
 import json
 
 import pytest
@@ -69,3 +70,73 @@ def test_stream_needs_refresh():
     assert youtube.stream_needs_refresh(None) is True
     assert youtube.stream_needs_refresh(t.time() + 10) is True  # below threshold
     assert youtube.stream_needs_refresh(t.time() + 99999) is False
+
+
+@pytest.mark.asyncio
+async def test_download_mp4_dedupe_concurrent(isolated_data_dir, monkeypatch):
+    call_count = 0
+    vid = "dedupetest"
+
+    # Pre-create the videos directory so download_mp4 can write the output file.
+    videos_dir = isolated_data_dir / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _fake_run_ytdlp(args, timeout=60):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)
+        # Simulate yt-dlp writing the output file; find the -o argument.
+        out_idx = args.index("-o")
+        (videos_dir / f"{vid}.mp4").write_bytes(b"fake")
+
+    monkeypatch.setattr(youtube, "_run_ytdlp", _fake_run_ytdlp)
+
+    paths = await asyncio.gather(
+        youtube.download_mp4(vid),
+        youtube.download_mp4(vid),
+    )
+
+    assert call_count == 1, f"yt-dlp was called {call_count} times; expected 1"
+    assert paths[0] == paths[1]
+
+from app.services.youtube import (
+    _classify_ytdlp_error,
+    YoutubeError,
+    YoutubeRateLimited,
+    YoutubeGeoBlocked,
+    YoutubeAgeRestricted,
+    YoutubePrivate,
+    YoutubeUnavailable,
+)
+
+def test_classify_ytdlp_error_buckets():
+    assert isinstance(_classify_ytdlp_error("HTTP Error 429: Too Many Requests"), YoutubeRateLimited)
+    assert isinstance(_classify_ytdlp_error("This video is not available in your country."), YoutubeGeoBlocked)
+    assert isinstance(_classify_ytdlp_error("Sign in to confirm your age"), YoutubeAgeRestricted)
+    assert isinstance(_classify_ytdlp_error("Video unavailable. This video is private."), YoutubePrivate)
+    assert isinstance(_classify_ytdlp_error("This live event will begin in 3 hours."), YoutubeUnavailable)
+    assert isinstance(_classify_ytdlp_error("Some random error"), YoutubeError)
+
+def test_run_ytdlp_raises_classified_error(monkeypatch):
+    import subprocess
+    class FakeCompletedProcess:
+        returncode = 1
+        stderr = "Sign in to confirm your age"
+        stdout = ""
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: FakeCompletedProcess())
+    with pytest.raises(YoutubeAgeRestricted):
+        youtube._run_ytdlp_sync(["--dummy"])
+
+def test_search_endpoint_maps_youtube_error_to_429(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    
+    # We must patch the async search function with an async fake
+    async def _fake_search(*args, **kwargs):
+        raise YoutubeRateLimited("rate limited")
+    monkeypatch.setattr(youtube, "search", _fake_search)
+    
+    client = TestClient(app)
+    resp = client.get("/api/search?q=test")
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["code"] == "rate_limited"

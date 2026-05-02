@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_LOCK = asyncio.Lock()
 _LAST_CALL_TS: float = 0.0
+
+from ._lock_cache import LockCache
+
+# Per-video-id locks to prevent concurrent yt-dlp downloads for the same video.
+_DOWNLOAD_LOCKS = LockCache(maxsize=256)
 
 
 @dataclass
@@ -51,8 +57,8 @@ def _ytdlp_executable() -> list[str]:
     exe = shutil.which("yt-dlp")
     if exe:
         return [exe]
-    # Fallback: python -m yt_dlp (works with pip --user installs)
-    return ["python", "-m", "yt_dlp"]
+    # Fallback: use sys.executable to avoid the Microsoft Store stub on Windows.
+    return [sys.executable, "-m", "yt_dlp"]
 
 
 def _ffmpeg_path() -> Optional[str]:
@@ -88,6 +94,46 @@ async def _rate_limit() -> None:
         _LAST_CALL_TS = time.monotonic()
 
 
+class YoutubeError(RuntimeError):
+    """Base class for classified yt-dlp failures."""
+    code = "youtube_error"
+    user_message = "影片載入失敗"
+
+class YoutubeRateLimited(YoutubeError):
+    code = "rate_limited"
+    user_message = "YouTube 請求過於頻繁，請稍候再試"
+
+class YoutubeGeoBlocked(YoutubeError):
+    code = "geo_blocked"
+    user_message = "此影片在您所在地區無法播放"
+
+class YoutubeAgeRestricted(YoutubeError):
+    code = "age_restricted"
+    user_message = "此影片需登入才能播放（請設定 cookies）"
+
+class YoutubePrivate(YoutubeError):
+    code = "private_video"
+    user_message = "此影片為私人或已被刪除"
+
+class YoutubeUnavailable(YoutubeError):
+    code = "unavailable"
+    user_message = "影片暫時無法播放"
+
+def _classify_ytdlp_error(stderr: str) -> YoutubeError:
+    s = stderr.lower()
+    if "http error 429" in s or "too many requests" in s:
+        return YoutubeRateLimited(stderr.strip()[:300])
+    if "this video is not available in your country" in s or "geo-restricted" in s:
+        return YoutubeGeoBlocked(stderr.strip()[:300])
+    if "sign in to confirm your age" in s or "age-restricted" in s:
+        return YoutubeAgeRestricted(stderr.strip()[:300])
+    if "video unavailable" in s or "private video" in s or "removed by the uploader" in s:
+        return YoutubePrivate(stderr.strip()[:300])
+    if "this live event will begin in" in s or "premiere" in s:
+        return YoutubeUnavailable(stderr.strip()[:300])
+    return YoutubeError(stderr.strip()[:300])
+
+
 def _run_ytdlp_sync(args: list[str], timeout: int = 60) -> str:
     cmd = _ytdlp_executable() + args
     logger.debug("ytdlp cmd: %s", cmd)
@@ -100,7 +146,7 @@ def _run_ytdlp_sync(args: list[str], timeout: int = 60) -> str:
         errors="replace",
     )
     if res.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {res.stderr.strip()[:500]}")
+        raise _classify_ytdlp_error(res.stderr)
     return res.stdout
 
 
@@ -211,18 +257,31 @@ def stream_needs_refresh(expires_at: Optional[float]) -> bool:
 
 
 async def download_mp4(video_id: str) -> Path:
-    """Download MP4 to local cache for offline playback / Demucs source."""
+    """Download MP4 to local cache for offline playback / Demucs source.
+
+    Raises ``LockCacheFullError`` if the per-video lock cache is full and
+    every entry is held — caller should treat as transient (HTTP 503) and
+    retry later. In normal operation this never triggers.
+    """
     settings = get_settings()
     out = settings.videos_dir / f"{video_id}.mp4"
+    # Fast path: file already exists before acquiring any lock.
     if out.exists():
         return out
-    args = _common_args() + [
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", str(out),
-        f"https://www.youtube.com/watch?v={video_id}",
-    ]
-    await _run_ytdlp(args, timeout=300)
+    # Acquire per-video lock so concurrent callers for the same video_id
+    # don't both invoke yt-dlp simultaneously.
+    lock = await _DOWNLOAD_LOCKS.get_lock(video_id)
+    async with lock:
+        # Re-check inside the lock: a concurrent caller may have finished by now.
+        if out.exists():
+            return out
+        args = _common_args() + [
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", str(out),
+            f"https://www.youtube.com/watch?v={video_id}",
+        ]
+        await _run_ytdlp(args, timeout=300)
     return out
 
 
