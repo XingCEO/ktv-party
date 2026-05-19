@@ -62,6 +62,7 @@ logs/
 .env.*.local
 
 # OMC state (per-tree, never checked in)
+.omx/
 .omc/
 api/.omc/
 web/.omc/
