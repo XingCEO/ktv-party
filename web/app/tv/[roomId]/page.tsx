@@ -41,6 +41,10 @@ export default function TvPage() {
   const lastVideoIdRef = useRef<string | null>(null);
   const activeIdxRef = useRef(-1);
   const fetchTokenRef = useRef<string | null>(null);
+  // performance.now() at the moment both elements were play()'d. The sync tick
+  // suppresses hard-seeks during the first few seconds — buffer is still
+  // filling and any seek there lands in still-loading territory.
+  const playbackStartedAtRef = useRef<number>(0);
 
   const playing = useMemo(() => queue.find((q) => q.status === "playing") || null, [queue]);
   const externalAudioUrl = useMemo(() => {
@@ -136,38 +140,72 @@ export default function TvPage() {
     return () => v.removeEventListener("ended", onEnded);
     }, [stream, roomId, playing?.id]);
 
-  // Drive video src imperatively so re-fetched stream URLs (mid-song refresh)
-  // can keep currentTime instead of yanking the singer back to t=0.
+  // Coordinated start: load video + (optional) external audio together and
+  // gate play() on BOTH elements reaching `canplay`. Starting the video alone
+  // while audio was still buffering produced the front-of-song stutter — the
+  // 500ms sync tick would detect drift, hard-seek audio into an unbuffered
+  // region, stall, and loop. Also resumes currentTime on mid-song URL refresh
+  // so the singer isn't yanked back to t=0.
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !stream) return;
+    const a = audioRef.current;
+    const audioUrl = externalAudioUrl;
+    const useAudio = !!(a && audioUrl);
     const sameSong = lastVideoIdRef.current === stream.video_id;
     const resumeAt = sameSong ? v.currentTime : 0;
     const wasPlaying = sameSong && !v.paused;
+    v.pause();
+    v.preload = "auto";
     v.src = stream.video_url;
-    const onLoaded = () => {
-      if (resumeAt > 0.5) v.currentTime = resumeAt;
-      if (wasPlaying || !sameSong) v.play().catch(() => {});
+    v.load();
+    if (useAudio && a) {
+      a.pause();
+      a.preload = "auto";
+      a.src = audioUrl!;
+      a.load();
+    }
+    let started = false;
+    let cancelled = false;
+    const startBoth = () => {
+      if (started || cancelled) return;
+      // canplay = readyState 3 (HAVE_FUTURE_DATA). Wait for both before play.
+      if (v.readyState < 3) return;
+      if (useAudio && a && a.readyState < 3) return;
+      started = true;
+      playbackStartedAtRef.current = performance.now();
+      if (resumeAt > 0.5) {
+        v.currentTime = resumeAt;
+        if (useAudio && a) a.currentTime = resumeAt;
+      }
+      if (wasPlaying || !sameSong) {
+        v.play().catch(() => {});
+        if (useAudio && a) a.play().catch(() => {});
+      }
     };
-    v.addEventListener("loadedmetadata", onLoaded, { once: true });
+    const onVReady = () => startBoth();
+    const onAReady = () => startBoth();
+    v.addEventListener("canplay", onVReady);
+    if (useAudio && a) a.addEventListener("canplay", onAReady);
+    // Safety: if audio never reaches canplay (CDN flake, codec issue), play
+    // video alone after 4s so we don't sit on a black screen forever.
+    const fallback = setTimeout(() => {
+      if (!started && !cancelled && v.readyState >= 2) {
+        started = true;
+        playbackStartedAtRef.current = performance.now();
+        if (resumeAt > 0.5) v.currentTime = resumeAt;
+        if (wasPlaying || !sameSong) v.play().catch(() => {});
+        if (useAudio && a) a.play().catch(() => {});
+      }
+    }, 4000);
     lastVideoIdRef.current = stream.video_id;
-    return () => v.removeEventListener("loadedmetadata", onLoaded);
-  }, [stream?.video_url, stream?.video_id]);
-
-  // Same trick for the external audio track when present.
-  useEffect(() => {
-    const a = audioRef.current;
-    const v = videoRef.current;
-    if (!a || !externalAudioUrl) return;
-    const resumeAt = v ? v.currentTime : 0;
-    a.src = externalAudioUrl;
-    const onLoaded = () => {
-      if (resumeAt > 0.5) a.currentTime = resumeAt;
-      if (v && !v.paused) a.play().catch(() => {});
+    return () => {
+      cancelled = true;
+      clearTimeout(fallback);
+      v.removeEventListener("canplay", onVReady);
+      if (a) a.removeEventListener("canplay", onAReady);
     };
-    a.addEventListener("loadedmetadata", onLoaded, { once: true });
-    return () => a.removeEventListener("loadedmetadata", onLoaded);
-  }, [externalAudioUrl]);
+  }, [stream?.video_url, stream?.video_id, externalAudioUrl]);
 
   // Stream URLs from yt-dlp expire (typ. ~6h). Re-fetch shortly before expiry so
   // long-running playback / idle TV doesn't break with a 403 mid-song.
@@ -206,23 +244,44 @@ export default function TvPage() {
   }, [externalAudioUrl]);
 
   // Sync external audio track with video time (DASH split / instrumental).
-  // Hard-seeking every 500ms on a 0.1s drift caused audible stutter at song
-  // start: the seek lands in still-buffering territory, audio stalls, drift
-  // grows, we seek again — loop. Instead nudge playbackRate for small drift,
-  // hard-seek (debounced) only when truly out of sync, and skip the tick
-  // entirely while audio is mid-seek or under-buffered.
+  // Three layers of stutter-avoidance:
+  //   1. Settle window — for the first 3s after coordinated start, never seek
+  //      and never nudge playbackRate. The buffer is still filling; any
+  //      adjustment lands in unbuffered territory and causes the very stutter
+  //      we're trying to suppress.
+  //   2. After settle, nudge playbackRate for small drift (<0.5s).
+  //   3. Hard-seek (heavily debounced) only when truly out of sync (>0.5s)
+  //      AND audio has enough buffered data ahead of the target to avoid
+  //      seeking into still-loading territory.
   useEffect(() => {
     const v = videoRef.current;
     const a = audioRef.current;
     if (!v || !a || !externalAudioUrl) return;
     let lastSeekAt = 0;
+    const SETTLE_MS = 3000;
+    const inSettle = () => {
+      const s = playbackStartedAtRef.current;
+      return s > 0 && performance.now() - s < SETTLE_MS;
+    };
+    const bufferedAhead = (el: HTMLMediaElement, target: number): number => {
+      for (let i = 0; i < el.buffered.length; i++) {
+        const start = el.buffered.start(i);
+        const end = el.buffered.end(i);
+        if (target >= start && target <= end) return end - target;
+      }
+      return 0;
+    };
     const sync = () => {
       if (a.seeking || a.readyState < 2) return;
       const drift = a.currentTime - v.currentTime;
       const abs = Math.abs(drift);
+      if (inSettle()) return;
       if (abs > 0.5) {
         const now = performance.now();
         if (now - lastSeekAt < 1500) return;
+        // Only hard-seek if audio has at least 1s buffered past the target;
+        // otherwise the seek will stall and we'll just re-detect drift next tick.
+        if (bufferedAhead(a, v.currentTime) < 1.0) return;
         lastSeekAt = now;
         a.currentTime = v.currentTime;
         a.playbackRate = 1;
@@ -420,6 +479,7 @@ export default function TvPage() {
                   ref={videoRef}
                   autoPlay
                   playsInline
+                  preload="auto"
                   // Set muted via JSX prop so the autoplay attempt sees the right
                   // value at first paint — setting it later via an effect was
                   // racing the autoplay policy and could leave the element paused.
