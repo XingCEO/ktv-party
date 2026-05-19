@@ -114,7 +114,7 @@ docker compose up --build
 
 ## 測試
 
-### Backend (pytest, 26 tests)
+### Backend (pytest)
 
 ```pwsh
 cd api

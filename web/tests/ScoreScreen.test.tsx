@@ -13,12 +13,16 @@ vi.mock("canvas-confetti", () => {
 describe("ScoreScreen", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.spyOn(window, "requestAnimationFrame").mockReturnValue(1);
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
   });
 
   afterEach(() => {
-    vi.runOnlyPendingTimers();
+    act(() => {
+      vi.runOnlyPendingTimers();
+    });
     vi.useRealTimers();
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
   it("does not render when visible=false", () => {

@@ -40,6 +40,7 @@ export type QueueItem = {
   position: number;
   status: QueueStatus;
   added_at: number;
+  started_at: number | null;
 };
 
 export type StreamInfo = {

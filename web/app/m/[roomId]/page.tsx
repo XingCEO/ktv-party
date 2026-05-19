@@ -69,6 +69,12 @@ function PhonePageContent() {
     // RoomSocket is in connecting/reconnecting; clear on first successful open.
     const offState = ws.onState((state) => {
       setReconnecting(state === "reconnecting" || state === "connecting");
+      if (state === "open") {
+        const identity = getIdentity();
+        if (identity) {
+          ws.send("identity", identity);
+        }
+      }
     });
 
     ws.connect();

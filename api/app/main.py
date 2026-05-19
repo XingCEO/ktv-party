@@ -531,6 +531,25 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
                 current = queue_repo.get_current_playing(room_id)
                 if current and current.started_at and time.time() - current.started_at > 30:
                     await _advance_via_endpoint(room_id)
+            elif event == "lyric.nudge":
+                current = queue_repo.get_current_playing(room_id)
+                item_id = data.get("item_id")
+                delta_sec = data.get("delta_sec")
+                if (
+                    current
+                    and item_id == current.id
+                    and isinstance(delta_sec, (int, float))
+                ):
+                    await safe_broadcast(
+                        room_id,
+                        "lyric.nudge",
+                        {
+                            "item_id": current.id,
+                            "video_id": current.video_id,
+                            "delta_sec": delta_sec,
+                        },
+                        exclude=ws,
+                    )
             elif event == "ping":
                 # Echo back the ts so the client can compute round-trip latency.
                 # Anything else in `data` is preserved for forward-compat.

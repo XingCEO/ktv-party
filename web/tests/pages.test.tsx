@@ -11,6 +11,8 @@ import "@testing-library/jest-dom/vitest";
 
 // ---------- shared mocks ----------------------------------------------------
 
+vi.mock("canvas-confetti", () => ({ default: vi.fn() }));
+
 vi.mock("next/navigation", () => ({
   useParams: () => ({ roomId: "room-test" }),
   useRouter: () => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn() }),
@@ -103,7 +105,14 @@ vi.mock("@/lib/api", async () => {
       resetTimer: vi.fn(),
       playbackNext: vi.fn(),
       search: vi.fn(async () => apiState.searchResults),
-      getStream: vi.fn(async () => null),
+      getStream: vi.fn(async (video_id: string) => ({
+        video_id,
+        video_url: "https://cdn.example/video.mp4",
+        audio_url: null,
+        instrumental_url: null,
+        expires_at: null,
+        has_subs: false,
+      })),
       getLyrics: vi.fn(async () => ({ video_id: "x", source: "fallback", title: null, artist: null, lines: [] })),
     },
   };
@@ -184,6 +193,10 @@ describe("Phone page (app/m/[roomId]/page.tsx)", () => {
     act(() => {
       lastSocket!.emitState("open");
     });
+    expect(lastSocket!.sentMessages).toContainEqual({
+      event: "identity",
+      data: { user_id: "u-1", nickname: "Alice" },
+    });
     await waitFor(() => {
       expect(screen.queryByText(/重連中/)).toBeNull();
     });
@@ -198,5 +211,50 @@ describe("Phone page (app/m/[roomId]/page.tsx)", () => {
     fireEvent.click(clapBtn);
 
     expect(lastSocket!.sentMessages.find((m) => m.event === "atmosphere.clap")).toBeTruthy();
+  });
+});
+
+// ---------- TV page ---------------------------------------------------------
+
+describe("TV page (app/tv/[roomId]/page.tsx)", () => {
+  it("applies presence and vocal-mode websocket updates", async () => {
+    apiState.queue = [{
+      id: 1,
+      room_id: "room-test",
+      user_id: "u-1",
+      nickname: "Alice",
+      video_id: "vid1",
+      title: "Test Song",
+      duration_sec: 200,
+      thumbnail_url: "",
+      vocal_mode: "original",
+      position: 1,
+      status: "playing",
+      added_at: 0,
+      started_at: 1,
+    }];
+
+    const Mod = await import("../app/tv/[roomId]/page");
+    const { api } = await import("../lib/api");
+    render(<Mod.default />);
+
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+    await waitFor(() => expect(api.getStream).toHaveBeenCalledWith("vid1"));
+    vi.mocked(api.getStream).mockClear();
+
+    act(() => {
+      lastSocket!.emit("presence.joined", { nickname: "Bob" });
+    });
+    expect(await screen.findByText("Bob")).toBeInTheDocument();
+
+    act(() => {
+      lastSocket!.emit("queue.vocal_mode.updated", {
+        item_id: 1,
+        vocal_mode: "instrumental",
+        queue: [{ ...apiState.queue[0], vocal_mode: "instrumental" }],
+      });
+    });
+
+    await waitFor(() => expect(api.getStream).toHaveBeenCalledWith("vid1"));
   });
 });

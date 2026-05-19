@@ -55,6 +55,25 @@ def test_atmosphere_combo_after_5_same_kind(client: TestClient):
         assert combo_evt["data"]["count"] == 5
         assert combo_evt["data"]["kind"] == "clap"
 
+
+def test_lyric_nudge_broadcasts_to_other_clients(client: TestClient):
+    rid = client.post("/api/rooms", json={"name": "WS_LYRIC"}).json()["id"]
+    client.post(
+        f"/api/rooms/{rid}/queue",
+        json={"video_id": "v1", "title": "t", "nickname": "alice"},
+    )
+
+    with client.websocket_connect(f"/ws/rooms/{rid}") as ws_sender, \
+         client.websocket_connect(f"/ws/rooms/{rid}") as ws_receiver:
+        _recv_skip_heartbeat(ws_sender)  # snapshot
+        _recv_skip_heartbeat(ws_receiver)  # snapshot
+
+        ws_sender.send_json({"event": "lyric.nudge", "data": {"item_id": 1, "delta_sec": 0.3}})
+
+        evt = _recv_skip_heartbeat(ws_receiver)
+        assert evt["event"] == "lyric.nudge"
+        assert evt["data"] == {"item_id": 1, "video_id": "v1", "delta_sec": 0.3}
+
 @pytest.mark.skip(
     reason="TestClient + nested websocket disconnect timing is non-deterministic; "
            "the broadcast-on-disconnect path is exercised by manual QA + the "

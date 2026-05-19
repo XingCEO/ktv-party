@@ -22,7 +22,7 @@
 | 3 | Demucs worker auto-respawn + queue cap | ✅ |
 | 4 | 8-component design system (Button/Input/Card/Badge/Toast/Spinner/IconButton/Skeleton) | ✅ |
 | 5 | 三頁全部用 design system 重畫 + Tailwind motion tokens | ✅ |
-| 6 | 101 tests pass + production build clean | ✅ |
+| 6 | Backend + frontend + e2e pass + production build clean | ✅ |
 
 ---
 

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -16,6 +16,18 @@ import { RoomSocket } from "@/lib/ws";
 import { buildPhoneUrl, makeQrDataUrl } from "@/lib/qr";
 import Atmosphere from "@/components/atmosphere/Atmosphere";
 import FloatingEmoji from "@/components/atmosphere/FloatingEmoji";
+import ComboEffect, { type ComboTrigger } from "@/components/effects/ComboEffect";
+import PresenceToast, { type PresenceEvent } from "@/components/effects/PresenceToast";
+import { ScoreScreen } from "@/components/effects/ScoreScreen";
+import { KaraokeLine } from "@/components/lyrics/KaraokeLine";
+
+type AtmosphereKind = "confetti" | "fireworks" | "clap" | "birthday";
+type Participant = { nickname?: string; user_id?: string };
+type ScoreState = { songTitle: string; singerName: string; seed: string } | null;
+
+function isAtmosphereKind(kind: string): kind is AtmosphereKind {
+  return kind === "confetti" || kind === "fireworks" || kind === "clap" || kind === "birthday";
+}
 
 export default function TvPage() {
   const params = useParams<{ roomId: string }>();
@@ -28,12 +40,18 @@ export default function TvPage() {
   const [qrUrl, setQrUrl] = useState<string>("");
   const [phoneUrl, setPhoneUrl] = useState<string>("");
   const [now, setNow] = useState(0);
-  const [atmosphere, setAtmosphere] = useState<{ kind: any; ts: number } | null>(null);
+  const [atmosphere, setAtmosphere] = useState<{ kind: AtmosphereKind; ts: number } | null>(null);
   const [emojiTrigger, setEmojiTrigger] = useState<{ kind: string; ts: number } | null>(null);
+  const [comboTrigger, setComboTrigger] = useState<ComboTrigger>(null);
+  const [presenceTrigger, setPresenceTrigger] = useState<PresenceEvent>(null);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [score, setScore] = useState<ScoreState>(null);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [lyricsExpanded, setLyricsExpanded] = useState(false);
   // Sync nudge: positive value makes lyrics appear earlier (compensates intro padding
   // on YouTube uploads vs. lrclib's album-master timing). Re-zeroed per song.
   const [lyricOffsetSec, setLyricOffsetSec] = useState(0);
+  const [lyricClockSec, setLyricClockSec] = useState(0);
   const [activeLyricIdx, setActiveLyricIdx] = useState(-1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -41,17 +59,40 @@ export default function TvPage() {
   const lastVideoIdRef = useRef<string | null>(null);
   const activeIdxRef = useRef(-1);
   const fetchTokenRef = useRef<string | null>(null);
+  const playingRef = useRef<QueueItem | null>(null);
+  const lyricClockRef = useRef(-1);
   // performance.now() at the moment both elements were play()'d. The sync tick
   // suppresses hard-seeks during the first few seconds — buffer is still
   // filling and any seek there lands in still-loading territory.
   const playbackStartedAtRef = useRef<number>(0);
 
   const playing = useMemo(() => queue.find((q) => q.status === "playing") || null, [queue]);
+  const playingVideoId = playing?.video_id;
+  const playingTitle = playing?.title;
   const externalAudioUrl = useMemo(() => {
     if (!stream) return null;
     if (playing?.vocal_mode === "instrumental" && stream.instrumental_url) return stream.instrumental_url;
     return stream.audio_url || null;
   }, [stream, playing?.vocal_mode]);
+
+  useEffect(() => {
+    playingRef.current = playing;
+  }, [playing]);
+
+  const applyLyricNudge = useCallback((delta: number, videoId?: string) => {
+    const targetVideoId = videoId ?? playingRef.current?.video_id;
+    setLyricOffsetSec((v) => {
+      const next = Math.round((v + delta) * 10) / 10;
+      if (targetVideoId && typeof window !== "undefined") {
+        try {
+          window.localStorage.setItem(`ktv-lyric-offset-${targetVideoId}`, String(next));
+        } catch {
+          /* quota: ignore */
+        }
+      }
+      return next;
+    });
+  }, []);
 
   // Initial load + QR
   useEffect(() => {
@@ -73,25 +114,91 @@ export default function TvPage() {
       if (m.event === "room.snapshot") {
         setQueue(m.data.queue || []);
         setTimer(m.data.timer);
+        setParticipants(m.data.participants || []);
+        return;
       }
-      if (m.event === "queue.added" || m.event === "queue.removed" || m.event === "queue.reordered" || m.event === "playback.advanced") {
+
+      if (
+        m.event === "queue.added" ||
+        m.event === "queue.removed" ||
+        m.event === "queue.reordered" ||
+        m.event === "queue.vocal_mode.updated"
+      ) {
         setQueue(m.data.queue || []);
+        const currentPlaying = playingRef.current;
+        if (m.event === "queue.vocal_mode.updated" && currentPlaying && m.data.item_id === currentPlaying.id) {
+          api.getStream(currentPlaying.video_id).then(setStream).catch(console.error);
+        }
+        return;
       }
+
+      if (m.event === "playback.advanced") {
+        const previous = playingRef.current;
+        const current = m.data.current as QueueItem | null | undefined;
+        if (previous && previous.id !== current?.id) {
+          setScore({
+            songTitle: previous.title,
+            singerName: previous.nickname,
+            seed: `${previous.id}:${previous.video_id}:${previous.nickname}`,
+          });
+        }
+        setQueue(m.data.queue || []);
+        return;
+      }
+
+      if (m.event === "atmosphere.combo") {
+        const ts = Date.now();
+        setComboTrigger({
+          kind: m.data.kind,
+          count: m.data.count,
+          multiplier: m.data.multiplier,
+          ts,
+        });
+        setEmojiTrigger({ kind: `atmosphere.${m.data.kind}`, ts });
+        return;
+      }
+
       if (m.event.startsWith("atmosphere.")) {
         const ts = Date.now();
-        const kind = m.event.replace("atmosphere.", "") as any;
-        setAtmosphere({ kind, ts });
+        const kind = m.event.replace("atmosphere.", "");
+        if (isAtmosphereKind(kind)) {
+          setAtmosphere({ kind, ts });
+        }
         setEmojiTrigger({ kind: m.event, ts });
+        return;
       }
-      if (m.event === "vocal_removal.ready" && playing && m.data.video_id === playing.video_id) {
+
+      const currentPlaying = playingRef.current;
+      if (m.event === "vocal_removal.ready" && currentPlaying && m.data.video_id === currentPlaying.video_id) {
         // reload stream to pick up instrumental
-        api.getStream(playing.video_id).then(setStream).catch(console.error);
+        api.getStream(currentPlaying.video_id).then(setStream).catch(console.error);
+        return;
       }
+
       if (m.event === "room.timer.started" || m.event === "room.timer.reset") {
         setTimer(m.data as RoomTimer);
+        return;
       }
-      if (m.event === "room.snapshot" && m.data.timer) {
-        setTimer(m.data.timer);
+
+      if (m.event === "presence.updated") {
+        setParticipants(m.data.participants || []);
+        return;
+      }
+
+      if (m.event === "presence.joined" || m.event === "presence.left") {
+        setPresenceTrigger({
+          kind: m.event === "presence.joined" ? "joined" : "left",
+          nickname: m.data.nickname,
+          ts: Date.now(),
+        });
+        return;
+      }
+
+      if (m.event === "lyric.nudge") {
+        const current = playingRef.current;
+        if (current && m.data.item_id === current.id && typeof m.data.delta_sec === "number") {
+          applyLyricNudge(m.data.delta_sec, current.video_id);
+        }
       }
     });
     ws.connect();
@@ -99,34 +206,34 @@ export default function TvPage() {
       off();
       ws.close();
     };
-  }, [roomId, playing?.video_id]);
+  }, [applyLyricNudge, roomId]);
 
   // When playing changes, fetch stream + lyrics. Clear immediately so the
   // previous song's lyrics don't linger, and guard against a late response
   // for the previous song stomping the current one.
   useEffect(() => {
-    if (!playing) {
+    if (!playingVideoId) {
       setStream(null);
       setLyrics(null);
       return;
     }
     setStream(null);
     setLyrics(null);
-    const myId = playing.video_id;
+    const myId = playingVideoId;
     fetchTokenRef.current = myId;
     api.getStream(myId).then((s) => {
       if (fetchTokenRef.current === myId) setStream(s);
     }).catch(console.error);
-    api.getLyrics(myId, playing.title).then((l) => {
+    api.getLyrics(myId, playingTitle).then((l) => {
       if (fetchTokenRef.current === myId) setLyrics(l);
     }).catch(console.error);
-  }, [playing?.video_id, playing?.title]);
+  }, [playingVideoId, playingTitle]);
 
   // Auto-attach ended handler. (currentTime is read in the rAF tick below, not
   // via timeupdate, since timeupdate only fires ~4Hz on most browsers.)
   useEffect(() => {
     const v = videoRef.current;
-      if (!v || !stream) return;
+    if (!v || !stream) return;
     const itemId = playing?.id;
     const onEnded = () => {
       // Server is the source of truth for advancement (services/scheduler.py).
@@ -138,7 +245,7 @@ export default function TvPage() {
     };
     v.addEventListener("ended", onEnded);
     return () => v.removeEventListener("ended", onEnded);
-    }, [stream, roomId, playing?.id]);
+  }, [stream, playing?.id]);
 
   // Coordinated start: load video + (optional) external audio together and
   // gate play() on BOTH elements reaching `canplay`. Starting the video alone
@@ -205,7 +312,7 @@ export default function TvPage() {
       v.removeEventListener("canplay", onVReady);
       if (a) a.removeEventListener("canplay", onAReady);
     };
-  }, [stream?.video_url, stream?.video_id, externalAudioUrl]);
+  }, [stream, externalAudioUrl]);
 
   // Stream URLs from yt-dlp expire (typ. ~6h). Re-fetch shortly before expiry so
   // long-running playback / idle TV doesn't break with a 403 mid-song.
@@ -216,7 +323,7 @@ export default function TvPage() {
       api.getStream(playing.video_id).then(setStream).catch(console.error);
     }, refreshAtMs);
     return () => clearTimeout(t);
-  }, [stream?.expires_at, playing?.video_id]);
+  }, [stream?.expires_at, playing]);
 
   // Recover from forbidden / network errors on the video element by re-fetching the stream.
   // Throttle: a flaky CDN can fire `error` repeatedly while the front of the song is
@@ -234,7 +341,7 @@ export default function TvPage() {
     };
     v.addEventListener("error", onError);
     return () => v.removeEventListener("error", onError);
-  }, [playing?.video_id]);
+  }, [playing]);
 
   // Mute video when an external audio track is in use (split DASH or instrumental)
   useEffect(() => {
@@ -337,6 +444,18 @@ export default function TvPage() {
     await api.playbackNext(roomId);
   }
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if (key === "q" || ((event.metaKey || event.ctrlKey) && key === "k")) {
+        event.preventDefault();
+        setQueueOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // Drive active-lyric tracking from rAF — `<video>` timeupdate only fires ~4Hz
   // and produced visible 100-250ms lag at line transitions. Reading currentTime
   // directly per frame and only setStating when the line index changes keeps
@@ -352,6 +471,11 @@ export default function TvPage() {
       const v = videoRef.current;
       if (v) {
         const t = v.currentTime + lyricOffsetSec;
+        const rounded = Math.round(t * 10) / 10;
+        if (rounded !== lyricClockRef.current) {
+          lyricClockRef.current = rounded;
+          setLyricClockSec(rounded);
+        }
         let idx = -1;
         const lines = lyrics.lines;
         for (let i = 0; i < lines.length; i++) {
@@ -367,7 +491,7 @@ export default function TvPage() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [lyrics, playing?.video_id, lyricOffsetSec]);
+  }, [lyrics, playing, lyricOffsetSec]);
 
   // Per-song offset is sticky — once a singer dials in the right number for a
   // particular YouTube upload (intro padding varies), replaying it later (or
@@ -381,7 +505,7 @@ export default function TvPage() {
     } catch {
       setLyricOffsetSec(0);
     }
-  }, [playing?.video_id]);
+  }, [playing]);
 
   function nudgeOffset(delta: number) {
     setLyricOffsetSec((v) => {
@@ -401,6 +525,15 @@ export default function TvPage() {
     <main className="min-h-screen flex flex-col bg-ktv-bg text-white">
       <Atmosphere trigger={atmosphere} />
       <FloatingEmoji trigger={emojiTrigger} />
+      <ComboEffect trigger={comboTrigger} />
+      <PresenceToast trigger={presenceTrigger} />
+      <ScoreScreen
+        visible={!!score}
+        songTitle={score?.songTitle || ""}
+        singerName={score?.singerName || ""}
+        seed={score?.seed || ""}
+        onDismiss={() => setScore(null)}
+      />
 
       {/* Top bar */}
       <header className="flex items-center justify-between px-6 py-3 bg-ktv-panel/70 border-b border-white/5">
@@ -417,6 +550,13 @@ export default function TvPage() {
             <span className="text-white/50">費用 </span>
             <span className="font-mono text-lg text-ktv-gold">${timer?.cost ?? 0}</span>
           </div>
+          <div>
+            <span className="text-white/50">Online </span>
+            <span className="font-mono text-lg text-ktv-mic">{participants.length}</span>
+          </div>
+          <button className="btn-ghost" onClick={() => setQueueOpen((v) => !v)}>
+            Queue ({queue.length})
+          </button>
           {!timer?.started_at ? (
             <button className="btn-primary" onClick={startTimer}>開始計費</button>
           ) : (
@@ -470,7 +610,7 @@ export default function TvPage() {
       {/* Main grid */}
       <div className="flex-1 grid grid-cols-12 gap-4 p-4 min-h-0">
         {/* Video + lyrics */}
-        <section className="col-span-9 panel overflow-hidden flex flex-col min-h-0">
+        <section className="col-span-12 panel overflow-hidden flex flex-col min-h-0">
           {playing && stream ? (
             <>
               <div className="relative bg-black flex-1 min-h-0">
@@ -496,7 +636,14 @@ export default function TvPage() {
                     <span className="ml-2 pill bg-ktv-mic text-black">伴奏</span>
                   )}
                 </div>
-                {/* Lyrics overlaid on the video — KTV-style. Gradient backdrop keeps text
+                {/* Keep the join QR visible without leaving the main video surface. */}
+                {qrUrl && (
+                  <div className="absolute right-4 bottom-4 z-10 rounded-xl bg-white p-1.5 shadow-2xl transition-transform hover:scale-150 hover:origin-bottom-right">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={qrUrl} alt="QR" className="h-20 w-20 rounded-lg" />
+                  </div>
+                )}
+                {/* Lyrics overlay. Gradient backdrop keeps text
                     readable over busy MV footage. Active line is centered and large; a
                     dimmed next-line preview sits below it. */}
                 <div
@@ -518,7 +665,12 @@ export default function TvPage() {
                               lyricsExpanded ? "text-6xl md:text-7xl" : "text-4xl md:text-5xl"
                             }`}
                           >
-                            {lyrics.lines[activeLyricIdx].text}
+                            <KaraokeLine
+                              text={lyrics.lines[activeLyricIdx].text}
+                              startSec={lyrics.lines[activeLyricIdx].time}
+                              endSec={lyrics.lines[activeLyricIdx + 1]?.time ?? lyrics.lines[activeLyricIdx].time + 4}
+                              currentSec={lyricClockSec}
+                            />
                           </motion.div>
                         ) : (
                           <motion.div
@@ -570,7 +722,11 @@ export default function TvPage() {
         </section>
 
         {/* Sidebar */}
-        <aside className="col-span-3 flex flex-col gap-4 min-h-0">
+        <aside
+          className={`fixed right-4 top-20 bottom-4 z-30 flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-4 min-h-0 transition-transform duration-200 ${
+            queueOpen ? "translate-x-0" : "translate-x-[calc(100%+2rem)]"
+          }`}
+        >
           <div className="panel p-4 flex flex-col items-center">
             <div className="text-xs text-white/60 mb-2">手機點歌</div>
             {qrUrl ? (
