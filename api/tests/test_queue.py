@@ -131,6 +131,43 @@ def test_insert_next(client):
     assert queued[0]["id"] == target["id"]
 
 
+def test_advance_records_history(client):
+    """Natural completion (not just skip) must populate song_history so that
+    charts / personal history / recommendations work."""
+    rid = _mk_room(client)
+    # alice's a1 becomes playing; bob's b1 queued.
+    client.post(f"/api/rooms/{rid}/queue", json={
+        "video_id": "a1", "title": "Song A", "nickname": "alice", "user_id": "uid-alice",
+    })
+    client.post(f"/api/rooms/{rid}/queue", json={
+        "video_id": "b1", "title": "Song B", "nickname": "bob", "user_id": "uid-bob",
+    })
+    # Advance: a1 completes -> should be recorded in history.
+    r = client.post(f"/api/rooms/{rid}/playback/next")
+    assert r.status_code == 200
+
+    charts = client.get("/api/charts/local").json()
+    assert any(c["video_id"] == "a1" for c in charts), "completed song missing from local charts"
+
+    history = client.get("/api/users/uid-alice/history").json()
+    assert any(h["video_id"] == "a1" for h in history), "completed song missing from user history"
+
+
+def test_favorites_crud(client):
+    uid = "uid-fav"
+    # Empty initially
+    assert client.get(f"/api/users/{uid}/favorites").json() == []
+    # Add
+    r = client.post(f"/api/users/{uid}/favorites", json={"video_id": "v1", "title": "Fav Song"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    favs = client.get(f"/api/users/{uid}/favorites").json()
+    assert len(favs) == 1 and favs[0]["video_id"] == "v1"
+    # Remove
+    r = client.delete(f"/api/users/{uid}/favorites/v1")
+    assert r.status_code == 204
+    assert client.get(f"/api/users/{uid}/favorites").json() == []
+
+
 def test_vocal_mode_broadcast_includes_queue(client):
     rid = _mk_room(client)
     with client.websocket_connect(f"/ws/rooms/{rid}") as ws:
