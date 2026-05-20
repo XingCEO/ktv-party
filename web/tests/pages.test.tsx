@@ -103,7 +103,7 @@ vi.mock("@/lib/api", async () => {
       removeQueueItem: vi.fn(async () => undefined),
       startTimer: vi.fn(),
       resetTimer: vi.fn(),
-      playbackNext: vi.fn(),
+      playbackNext: vi.fn(async () => null),
       search: vi.fn(async () => apiState.searchResults),
       getStream: vi.fn(async (video_id: string) => ({
         video_id,
@@ -119,6 +119,13 @@ vi.mock("@/lib/api", async () => {
       getPronunciation: vi.fn(async () => ({ video_id: "x", lang: "zh", items: [] })),
       getLocalCharts: vi.fn(async () => []),
       getPopularArtists: vi.fn(async () => []),
+      getFavorites: vi.fn(async () => []),
+      addFavorite: vi.fn(async () => ({ ok: true })),
+      removeFavorite: vi.fn(async () => undefined),
+      getUserHistory: vi.fn(async () => []),
+      getRecommend: vi.fn(async () => []),
+      getWeeklyHot: vi.fn(async () => []),
+      resolveChart: vi.fn(async () => null),
       setSkipMode: vi.fn(async () => undefined),
       setTheme: vi.fn(async () => undefined),
       extendRoom: vi.fn(async () => undefined),
@@ -211,6 +218,105 @@ describe("Phone page (app/m/[roomId]/page.tsx)", () => {
     });
   });
 
+  it("探索 panel lists local-chart hits and 點播 adds them to the queue", async () => {
+    const Mod = await import("../app/m/[roomId]/page");
+    const { api } = await import("../lib/api");
+    vi.mocked(api.getLocalCharts).mockResolvedValue([
+      { video_id: "hot1", title: "Hot Song", play_count: 9 },
+    ] as any);
+
+    render(<Mod.default />);
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: /探索/ }));
+    expect(await screen.findByText("Hot Song")).toBeInTheDocument();
+
+    const addBtns = screen.getAllByRole("button", { name: "點播" });
+    fireEvent.click(addBtns[0]);
+    await waitFor(() => expect(api.addToQueue).toHaveBeenCalled());
+  });
+
+  it("排行榜 tab resolves placeholder chart id to a real hit before queueing", async () => {
+    const Mod = await import("../app/m/[roomId]/page");
+    const { api } = await import("../lib/api");
+    vi.mocked(api.getWeeklyHot).mockResolvedValue([
+      { source: "applemusic", chart_key: "tw", video_id: "apple:1:想你", title: "想你", artist: "歌手A", rank_no: 1 },
+    ] as any);
+    vi.mocked(api.resolveChart).mockResolvedValue({
+      video_id: "real9", title: "想你", channel: "歌手A", duration_sec: 200, thumbnail_url: "", view_count: 0,
+    } as any);
+
+    render(<Mod.default />);
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: /探索/ }));
+    fireEvent.click(screen.getByRole("button", { name: /排行榜/ }));
+    expect(await screen.findByText("想你")).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "點播" })[0]);
+    await waitFor(() => expect(api.resolveChart).toHaveBeenCalledWith("想你", "歌手A"));
+    await waitFor(() =>
+      expect(api.addToQueue).toHaveBeenCalledWith(
+        "room-test",
+        expect.objectContaining({ video_id: "real9" }),
+      ),
+    );
+  });
+
+  it("對唱 mode sends the chosen partner on add", async () => {
+    const Mod = await import("../app/m/[roomId]/page");
+    const { api } = await import("../lib/api");
+
+    render(<Mod.default />);
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+
+    // Populate participants via snapshot so the partner picker has options.
+    act(() => {
+      lastSocket!.emit("room.snapshot", {
+        queue: [],
+        participants: [
+          { user_id: "u-1", nickname: "Alice" },
+          { user_id: "u-2", nickname: "Bob" },
+        ],
+      });
+    });
+
+    // Run a search to get an addable result.
+    fireEvent.change(screen.getByPlaceholderText(/搜尋歌曲/), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: "搜尋" }));
+    await waitFor(() => expect(screen.getByText("Test Song")).toBeInTheDocument());
+
+    // Switch to 對唱 and pick Bob.
+    fireEvent.click(screen.getByRole("button", { name: "對唱" }));
+    fireEvent.change(screen.getByLabelText("對唱夥伴"), { target: { value: "u-2" } });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "點播" })[0]);
+    await waitFor(() =>
+      expect(api.addToQueue).toHaveBeenCalledWith(
+        "room-test",
+        expect.objectContaining({
+          performance_mode: "duet",
+          duet_partner_user_id: "u-2",
+          duet_partner_nickname: "Bob",
+        }),
+      ),
+    );
+  });
+
+  it("shows an empty-state when search returns no results", async () => {
+    const Mod = await import("../app/m/[roomId]/page");
+    const { api } = await import("../lib/api");
+    vi.mocked(api.search).mockResolvedValueOnce([]);
+
+    render(<Mod.default />);
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+
+    fireEvent.change(screen.getByPlaceholderText(/搜尋歌曲/), { target: { value: "zzz" } });
+    fireEvent.click(screen.getByRole("button", { name: "搜尋" }));
+
+    expect(await screen.findByText("找不到相關歌曲")).toBeInTheDocument();
+  });
+
   it("atmosphere buttons send the correct WS event", async () => {
     const Mod = await import("../app/m/[roomId]/page");
     render(<Mod.default />);
@@ -226,6 +332,25 @@ describe("Phone page (app/m/[roomId]/page.tsx)", () => {
 // ---------- TV page ---------------------------------------------------------
 
 describe("TV page (app/tv/[roomId]/page.tsx)", () => {
+  it("shows an error card and can skip when the stream fails to resolve", async () => {
+    apiState.queue = [{
+      id: 7, room_id: "room-test", user_id: "u-1", nickname: "Alice",
+      video_id: "bad1", title: "Broken Video", duration_sec: 200, thumbnail_url: "",
+      vocal_mode: "original", position: 1, status: "playing", added_at: 0, started_at: 1,
+    }];
+    const Mod = await import("../app/tv/[roomId]/page");
+    const { api } = await import("../lib/api");
+    vi.mocked(api.getStream).mockRejectedValueOnce(new Error("403 private"));
+
+    render(<Mod.default />);
+    await waitFor(() => expect(lastSocket).not.toBeNull());
+
+    expect(await screen.findByText("無法載入此影片")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "立即跳過" }));
+    await waitFor(() => expect(api.playbackNext).toHaveBeenCalledWith("room-test"));
+  });
+
   it("applies presence and vocal-mode websocket updates", async () => {
     apiState.queue = [{
       id: 1,
