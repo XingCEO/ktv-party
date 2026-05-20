@@ -315,8 +315,22 @@ def get_current_playing(room_id: str) -> Optional[QueueItem]:
 
 
 def advance_to_next(room_id: str) -> Optional[QueueItem]:
-    """Mark current playing as done and start the next queued item."""
+    """Mark current playing as done and start the next queued item.
+
+    Records the completed song in song_history so charts / personal history /
+    recommendations populate on natural completion — not only when a song is
+    explicitly skipped. This is the path the scheduler, the /playback/next
+    endpoint, and the TV end-hint all funnel through.
+    """
+    completed: Optional[QueueItem] = None
+    started_next = False
     with transaction() as conn:
+        prev = conn.execute(
+            "SELECT * FROM queue_items WHERE room_id = ? AND status = 'playing' ORDER BY position ASC LIMIT 1",
+            (room_id,),
+        ).fetchone()
+        if prev:
+            completed = _row_to_item(prev)
         conn.execute(
             "UPDATE queue_items SET status = 'done' WHERE room_id = ? AND status = 'playing'",
             (room_id,),
@@ -325,16 +339,19 @@ def advance_to_next(room_id: str) -> Optional[QueueItem]:
             "SELECT * FROM queue_items WHERE room_id = ? AND status = 'queued' ORDER BY position ASC, id ASC LIMIT 1",
             (room_id,),
         ).fetchone()
-        if not row:
-            return None
-        conn.execute(
-            "UPDATE queue_items SET status = 'playing', started_at = ? WHERE id = ?",
-            (
-                time.time(),
-                row["id"],
-            ),
-        )
-    return get_current_playing(room_id)
+        if row:
+            conn.execute(
+                "UPDATE queue_items SET status = 'playing', started_at = ? WHERE id = ?",
+                (
+                    time.time(),
+                    row["id"],
+                ),
+            )
+            started_next = True
+    # Save history after the transaction commits (save_song_history opens its own).
+    if completed:
+        save_song_history(room_id, completed)
+    return get_current_playing(room_id) if started_next else None
 
 
 def skip_current(room_id: str) -> Optional[QueueItem]:

@@ -130,13 +130,53 @@ def test_run_ytdlp_raises_classified_error(monkeypatch):
 def test_search_endpoint_maps_youtube_error_to_429(monkeypatch):
     from fastapi.testclient import TestClient
     from app.main import app
-    
+
     # We must patch the async search function with an async fake
     async def _fake_search(*args, **kwargs):
         raise YoutubeRateLimited("rate limited")
     monkeypatch.setattr(youtube, "search", _fake_search)
-    
+
     client = TestClient(app)
     resp = client.get("/api/search?q=test")
     assert resp.status_code == 429
     assert resp.json()["detail"]["code"] == "rate_limited"
+
+
+def test_resolve_chart_returns_top_hit(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services.youtube import SearchHit
+
+    async def _fake_search(q, n=10):
+        return [
+            SearchHit(
+                video_id="real1",
+                title="解析後的歌",
+                channel="某歌手",
+                duration_sec=210,
+                thumbnail_url="http://t/r.jpg",
+                view_count=42,
+            )
+        ]
+
+    monkeypatch.setattr(youtube, "search", _fake_search)
+    client = TestClient(app)
+    resp = client.get("/api/charts/resolve?title=想你&artist=某歌手")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["video_id"] == "real1"
+    assert body["duration_sec"] == 210
+
+
+def test_resolve_chart_no_hit_returns_null(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    async def _fake_search(q, n=10):
+        return []
+
+    monkeypatch.setattr(youtube, "search", _fake_search)
+    client = TestClient(app)
+    resp = client.get("/api/charts/resolve?title=不存在的歌")
+    assert resp.status_code == 200
+    assert resp.json() is None

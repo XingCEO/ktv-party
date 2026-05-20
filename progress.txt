@@ -1,5 +1,109 @@
 # KTV Box - Progress Log
 
+## 2026-05-20 (Iteration 7) - TV stream-failure recovery - COMPLETE
+
+### Hardening
+- TV (/tv/:id): getStream failure for the playing song previously fell through to
+  the idle "等待點歌中" splash (looks like an empty room) and the broken song sat
+  until the server scheduler force-advanced after full duration. Now:
+  - streamError state set on initial resolve failure.
+  - Three-way render: video / error card (⚠️ 無法載入此影片 + 立即跳過 btn) /
+    loading card (🎬 影片載入中) / idle splash.
+  - Auto-skip: 5s after streamError, calls playbackNext (advances immediately,
+    no 30s endHint guard).
+
+### Verification
+- Frontend vitest: 69 pass (+TV stream-error test), typecheck clean, build clean.
+- Backend unchanged (62 pass / 1 skip).
+
+## 2026-05-20 (Iteration 6) - Stability polish - COMPLETE
+
+### Hardening
+- web/lib/api.ts req(): parse FastAPI {detail:{code,message}} / {detail} string so
+  toasts show the human message (e.g. YouTube rate-limit text) instead of
+  "429 /api/...". Falls back to status / raw text.
+- Phone addByVideo: now wraps resolve+add in try/catch and toasts on failure, so
+  Discover-panel adds can't throw unhandled rejections or fail silently.
+- Phone search: '找不到相關歌曲' empty-state after a search returns nothing.
+
+### Verification
+- Frontend vitest: 68 pass (+3 api error-surfacing, +1 search empty-state),
+  typecheck clean, next build clean.
+- Backend unchanged (62 pass / 1 skip).
+
+## 2026-05-20 (Iteration 5) - Duet/chorus usable - COMPLETE
+
+### Bug fixed
+- Phone exposed performance_mode=duet but addByVideo never sent
+  duet_partner_user_id, so the backend (queue.add_to_queue duet branch) raised
+  ValueError -> 400. Duet was selectable but always failed.
+
+### Feature
+- Phone now tracks participants from WS (room.snapshot + presence.updated).
+- Add area: 獨唱/對唱/合唱 picker (was previously buried in the singer-only panel
+  and unusable for new adds). When 對唱, a partner <select> lists other
+  participants; add sends duet_partner_user_id/nickname. Warns if duet w/o partner.
+
+### Verification
+- Frontend vitest: 64 pass (+對唱 partner test), typecheck clean, next build clean
+- Backend unchanged (62 pass / 1 skip from iter 4).
+
+## 2026-05-20 (Iteration 4) - Weekly-hot chart actionable - COMPLETE
+
+### Feature
+- Backend GET /api/charts/resolve?title=&artist= → youtube.search top hit as
+  SearchResult (or null). Lets external chart entries (placeholder video_id
+  apple:idx:title) become playable.
+- web/lib/api.ts: resolveChart(title, artist?).
+- Phone DiscoverPanel: new 排行榜 tab (getWeeklyHot / iTunes 台灣). On 點播,
+  addByVideo detects apple: placeholder ids and resolves to a real YouTube hit
+  first; warns "找不到可播放的版本" if none.
+
+### Verification
+- Backend pytest: 63 pass / 1 skip (+test_resolve_chart_returns_top_hit, _no_hit_returns_null)
+- Frontend vitest: 63 pass (+排行榜 resolve test), typecheck clean, next build clean
+
+## 2026-05-20 (Iteration 3) - TV board + pronunciation + idle attract - COMPLETE
+
+### Features
+- TV board (/tv/:id/board): full rewrite. Live WS queue (was 3s poll), proper
+  "點播佇列" with playing highlight + numbered queued list, and two charts panels —
+  本週熱門點播 (local, getLocalCharts) and iTunes 台灣排行榜 (getWeeklyHot, display-only
+  with disclaimer). NOTE: weekly-hot rows carry placeholder video_id (apple:idx:title)
+  from charts_cache, so they are intentionally non-addable.
+- TV main (/tv/:id): pinyin/romaji annotation now renders under the ACTIVE lyric line
+  (previously only under the dimmed next-line preview). Gated by existing 注/拼 + ZH/JA
+  toggles.
+- TV idle attract screen: when nothing playing, shows 本包廂熱門點播 top-6 (local charts)
+  below the join QR instead of QR alone.
+
+### Verification
+- Backend pytest: 62 pass / 1 skip
+- Frontend vitest: 62 pass, typecheck clean, next build clean
+- board page rewrite delegated to executor agent (parallel with TV-main edits); both
+  verified green together.
+
+## 2026-05-20 (Iteration 2) - Discover + history fix - COMPLETE
+
+### Bug fixed (completeness)
+- `queue.advance_to_next` never wrote `song_history` — only the skip path did.
+  Natural song completion (scheduler force-advance, /playback/next endpoint,
+  TV end-hint) left charts / personal history / recommendations empty. Now
+  records the completed song before promoting the next one.
+
+### Features
+- Backend: DELETE `/api/users/{user_id}/favorites/{video_id}` (completes favorites CRUD).
+- web/lib/api.ts: wired previously-unreachable endpoints — getFavorites/addFavorite/
+  removeFavorite, getUserHistory, getRecommend, getWeeklyHot.
+- Phone (/m): new collapsible "探索" DiscoverPanel (我的最愛 / 熱門榜 / 推薦) with
+  one-tap 點播; ♥ favorite toggle on search results + discover items.
+- components/discover/DiscoverPanel.tsx (new).
+
+### Verification
+- Backend pytest: 62 pass / 1 skip (added test_advance_records_history, test_favorites_crud)
+- Frontend vitest: 62 pass (added 探索 panel test)
+- typecheck clean, next build clean
+
 ## 2026-04-28 (Iteration 1) - COMPLETE
 
 ### Environment

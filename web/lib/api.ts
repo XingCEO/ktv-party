@@ -86,7 +86,20 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!r.ok) {
     const text = await r.text().catch(() => "");
-    throw new Error(`${r.status} ${path}: ${text}`);
+    // FastAPI errors come back as {detail: ...} where detail is either a plain
+    // string or our structured {code, message}. Surface the human message so
+    // toasts read like "已被 YouTube 限流，請稍後再試" instead of "429 /api/...".
+    let msg = "";
+    try {
+      const body = JSON.parse(text);
+      const d = body?.detail;
+      if (typeof d === "string") msg = d;
+      else if (d && typeof d.message === "string") msg = d.message;
+      else if (typeof body?.message === "string") msg = body.message;
+    } catch {
+      msg = text;
+    }
+    throw new Error(msg || `請求失敗 (${r.status})`);
   }
   if (r.status === 204) return undefined as T;
   return r.json() as Promise<T>;
@@ -180,6 +193,38 @@ export const api = {
     req<{ status: string; job_id?: string; path?: string }>(`/api/songs/${video_id}/instrumental`, {
       method: "POST",
     }),
+
+  getUserHistory: (user_id: string) =>
+    req<Array<{ video_id: string; title: string; nickname: string; created_at: number }>>(
+      `/api/users/${encodeURIComponent(user_id)}/history`,
+    ),
+  getFavorites: (user_id: string) =>
+    req<Array<{ video_id: string; title: string; created_at: number }>>(
+      `/api/users/${encodeURIComponent(user_id)}/favorites`,
+    ),
+  addFavorite: (user_id: string, video_id: string, title: string) =>
+    req<{ ok: boolean }>(`/api/users/${encodeURIComponent(user_id)}/favorites`, {
+      method: "POST",
+      body: JSON.stringify({ video_id, title }),
+    }),
+  removeFavorite: (user_id: string, video_id: string) =>
+    req<void>(
+      `/api/users/${encodeURIComponent(user_id)}/favorites/${encodeURIComponent(video_id)}`,
+      { method: "DELETE" },
+    ),
+  getRecommend: (video_id: string) =>
+    req<Array<{ video_id: string; title: string; channel: string | null; thumbnail_url: string | null; duration_sec: number | null }>>(
+      `/api/songs/${video_id}/recommend`,
+    ),
+  getWeeklyHot: (limit = 50) =>
+    req<Array<{ source: string; chart_key: string; video_id: string; title: string; artist: string | null; rank_no: number }>>(
+      `/api/charts/weekly-hot?limit=${limit}`,
+    ),
+  resolveChart: (title: string, artist?: string) => {
+    const qs = new URLSearchParams({ title });
+    if (artist) qs.set("artist", artist);
+    return req<SearchResult | null>(`/api/charts/resolve?${qs}`);
+  },
 };
 
 export function fmtDuration(sec: number | null | undefined): string {

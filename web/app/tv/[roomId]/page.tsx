@@ -47,6 +47,8 @@ export default function TvPage() {
   const [barrages, setBarrages] = useState<Array<{ id: number; text: string }>>([]);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [score, setScore] = useState<ScoreState>(null);
+  const [idleCharts, setIdleCharts] = useState<Array<{ video_id: string; title: string; play_count: number }>>([]);
+  const [streamError, setStreamError] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
   const [lyricsExpanded, setLyricsExpanded] = useState(false);
   const [theme, setTheme] = useState("cashbox-green");
@@ -110,6 +112,14 @@ export default function TvPage() {
       makeQrDataUrl(url, 256).then(setQrUrl).catch(console.error);
     }
   }, [roomId]);
+
+  // Idle attract screen: when nothing is playing, surface the room's most-played
+  // songs so a quiet room shows inspiration instead of a bare QR. Refreshes when
+  // the room goes idle again (e.g. after the last queued song finishes).
+  useEffect(() => {
+    if (playing) return;
+    api.getLocalCharts("week").then((rows) => setIdleCharts(rows.slice(0, 6))).catch(() => {});
+  }, [playing]);
 
   // WebSocket
   useEffect(() => {
@@ -267,11 +277,17 @@ export default function TvPage() {
     }
     setStream(null);
     setLyrics(null);
+    setStreamError(false);
     const myId = playingVideoId;
     fetchTokenRef.current = myId;
     api.getStream(myId).then((s) => {
       if (fetchTokenRef.current === myId) setStream(s);
-    }).catch(console.error);
+    }).catch((e) => {
+      console.error(e);
+      // Initial resolve failed (private / geo-blocked / expired). Surface it and
+      // let the auto-skip effect advance past the broken song quickly.
+      if (fetchTokenRef.current === myId) setStreamError(true);
+    });
     api.getLyrics(myId, playingTitle).then((l) => {
       if (fetchTokenRef.current === myId) setLyrics(l);
     }).catch(console.error);
@@ -284,6 +300,17 @@ export default function TvPage() {
       setAnnoMap(map);
     }).catch(() => setAnnoMap({}));
   }, [playingVideoId, playingTitle, annoLang]);
+
+  // If the playing song's stream can't be resolved, don't sit on a broken/black
+  // screen for the full song duration waiting on the server scheduler — advance
+  // past it after a short notice.
+  useEffect(() => {
+    if (!streamError || !playing) return;
+    const t = setTimeout(() => {
+      api.playbackNext(roomId).catch(console.error);
+    }, 5000);
+    return () => clearTimeout(t);
+  }, [streamError, playing, roomId]);
 
   // Auto-attach ended handler. (currentTime is read in the rAF tick below, not
   // via timeupdate, since timeupdate only fires ~4Hz on most browsers.)
@@ -810,6 +837,15 @@ export default function TvPage() {
                           </motion.div>
                         )}
                       </AnimatePresence>
+                      {annoOn && activeLyricIdx >= 0 && lyrics.lines[activeLyricIdx] && annoMap[lyrics.lines[activeLyricIdx].text] && (
+                        <div
+                          className={`mt-2 text-center text-ktv-mic font-semibold [text-shadow:_0_2px_6px_rgba(0,0,0,0.95)] ${
+                            lyricsExpanded ? "text-2xl" : "text-lg"
+                          }`}
+                        >
+                          {annoMap[lyrics.lines[activeLyricIdx].text]}
+                        </div>
+                      )}
                       {lyrics.lines[activeLyricIdx + 1] && (
                         <div
                           className={`mt-3 text-white/70 text-center leading-snug [text-shadow:_0_2px_6px_rgba(0,0,0,0.95)] ${
@@ -831,6 +867,25 @@ export default function TvPage() {
                 </div>
               </div>
             </>
+          ) : playing && streamError ? (
+            // Stream resolve failed — show why and auto-skip (see effect above).
+            <div className="flex-1 flex flex-col items-center justify-center gap-5 p-8 text-center">
+              <div className="text-6xl">⚠️</div>
+              <div className="text-3xl text-ktv-accent font-bold">無法載入此影片</div>
+              <div className="text-lg text-white/70">可能為私人、地區限制或連結失效，即將跳過…</div>
+              {playing?.title && <div className="text-white/50 max-w-xl truncate">{playing.title}</div>}
+              <button type="button" className="btn-primary" onClick={() => api.playbackNext(roomId).catch(console.error)}>
+                立即跳過
+              </button>
+            </div>
+          ) : playing ? (
+            // Song is playing but stream/buffer not ready yet — show a loading
+            // state instead of the idle splash (which falsely implies an empty room).
+            <div className="flex-1 flex flex-col items-center justify-center gap-5 p-8 text-center">
+              <div className="text-5xl animate-pulse">🎬</div>
+              <div className="text-2xl text-white/70">影片載入中…</div>
+              {playing?.title && <div className="text-white/50 max-w-xl truncate">{playing.title}</div>}
+            </div>
           ) : (
             // Idle splash — show a giant QR so phones can join without squinting at the sidebar.
             <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8">
@@ -845,6 +900,27 @@ export default function TvPage() {
               <div className="text-xl text-white/70">手機掃描 QR 加入點唱</div>
               {phoneUrl && (
                 <div className="text-sm text-white/40 break-all max-w-xl text-center">{phoneUrl}</div>
+              )}
+              {idleCharts.length > 0 && (
+                <div className="mt-6 w-full max-w-md">
+                  <div className="text-sm font-bold text-ktv-gold/80 uppercase tracking-widest text-center mb-3">
+                    🔥 本包廂熱門點播
+                  </div>
+                  <ul className="space-y-2">
+                    {idleCharts.map((c, i) => (
+                      <li
+                        key={`${c.video_id}-${i}`}
+                        className="flex items-center gap-3 panel px-4 py-2 text-left"
+                      >
+                        <span className="text-xl font-extrabold text-white/25 w-7 text-center shrink-0">
+                          {i + 1}
+                        </span>
+                        <span className="flex-1 truncate text-white/85">{c.title}</span>
+                        <span className="text-sm text-white/40 shrink-0">{c.play_count} 次</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           )}

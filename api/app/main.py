@@ -695,6 +695,14 @@ async def get_favorites(user_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+@app.delete("/api/users/{user_id}/favorites/{video_id}", status_code=204)
+async def remove_favorite(user_id: str, video_id: str) -> None:
+    get_conn().execute(
+        "DELETE FROM favorite_songs WHERE user_id = ? AND video_id = ?",
+        (user_id, video_id),
+    )
+
+
 @app.get("/api/charts/local")
 async def get_local_charts(period: str = "week") -> list[dict]:
     span = 7 * 86400 if period == "week" else 30 * 86400
@@ -745,6 +753,30 @@ async def get_weekly_hot(limit: int = 50) -> list[dict]:
         .fetchall()
     )
     return [dict(r) for r in rows]
+
+
+@app.get("/api/charts/resolve", response_model=Optional[SearchResult])
+async def resolve_chart(
+    title: str = Query(..., min_length=1), artist: str = ""
+) -> Optional[SearchResult]:
+    """Resolve an external chart entry (which has no real YouTube id) to a
+    playable search hit so it can be queued. Returns the top match or null."""
+    q = f"{title} {artist}".strip()
+    try:
+        hits = await youtube.search(q, n=1)
+    except YoutubeRateLimited as exc:
+        raise HTTPException(429, {"code": exc.code, "message": exc.user_message})
+    except (YoutubeGeoBlocked, YoutubeAgeRestricted, YoutubePrivate) as exc:
+        raise HTTPException(403, {"code": exc.code, "message": exc.user_message})
+    except YoutubeUnavailable as exc:
+        raise HTTPException(404, {"code": exc.code, "message": exc.user_message})
+    except YoutubeError as exc:
+        raise HTTPException(502, {"code": exc.code, "message": exc.user_message})
+    except Exception as exc:
+        raise HTTPException(502, f"resolve failed: {exc}")
+    if not hits:
+        return None
+    return SearchResult(**hits[0].__dict__)
 
 
 @app.get("/api/songs/{video_id}/recommend")

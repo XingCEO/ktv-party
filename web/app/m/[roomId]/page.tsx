@@ -13,6 +13,7 @@ import { Card, CardBody } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { IconButton } from "@/components/ui/IconButton";
 import { Spinner } from "@/components/ui/Spinner";
+import { DiscoverPanel, type DiscoverItem } from "@/components/discover/DiscoverPanel";
 import { motion, AnimatePresence } from "framer-motion";
 
 function PhonePageContent() {
@@ -23,9 +24,12 @@ function PhonePageContent() {
   const [q, setQ] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [vocalMode, setVocalMode] = useState<"original" | "instrumental">("original");
   const [performanceMode, setPerformanceMode] = useState<"solo" | "duet" | "chorus">("solo");
+  const [participants, setParticipants] = useState<Array<{ nickname?: string; user_id?: string }>>([]);
+  const [duetPartnerId, setDuetPartnerId] = useState("");
   const [dedicateTo, setDedicateTo] = useState("");
   const [reconnecting, setReconnecting] = useState(false);
   const [addingId, setAddingId] = useState<string | null>(null);
@@ -59,6 +63,10 @@ function PhonePageContent() {
     const off = ws.on((m) => {
       if (m.event === "room.snapshot") {
         handleQueueUpdate(m.data.queue || []);
+        setParticipants(m.data.participants || []);
+      }
+      if (m.event === "presence.updated") {
+        setParticipants(m.data.participants || []);
       }
       if (m.event === "queue.added" || m.event === "queue.removed" || m.event === "queue.reordered" || m.event === "playback.advanced" || m.event === "queue.vocal_mode.updated") {
         handleQueueUpdate(m.data.queue || []);
@@ -111,6 +119,7 @@ function PhonePageContent() {
   const doSearch = useCallback(async () => {
     if (!q.trim()) return;
     setSearching(true);
+    setHasSearched(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
     try {
       setResults(await api.search(q.trim(), 12));
@@ -121,30 +130,93 @@ function PhonePageContent() {
     }
   }, [q, toast]);
 
-  const addSong = useCallback(async (s: SearchResult) => {
-    if (!confirmedNick || addingId) return;
-    setAddingId(s.video_id);
+  // Self-contained: handles its own errors so every caller (search results AND
+  // the Discover panel) is safe — a failed add toasts instead of throwing an
+  // unhandled rejection or silently doing nothing.
+  const addByVideo = useCallback(async (it: DiscoverItem | SearchResult) => {
+    if (!confirmedNick) return;
+    const id = getIdentity();
+    // Duet requires a partner — the backend rejects a duet add without one.
+    let duetPartner: { user_id: string; nickname: string } | null = null;
+    if (performanceMode === "duet") {
+      const p = participants.find((x) => x.user_id === duetPartnerId);
+      if (!p?.user_id) {
+        toast({ variant: "warning", message: "對唱請先選擇一位夥伴" });
+        return;
+      }
+      duetPartner = { user_id: p.user_id, nickname: p.nickname || "夥伴" };
+    }
     try {
-      const id = getIdentity();
+      let target: { video_id: string; title: string; duration_sec?: number | null; thumbnail_url?: string | null; channel?: string | null } = it;
+      // External chart entries carry a placeholder id (apple:idx:title) and aren't
+      // playable — resolve to a real YouTube hit before queueing.
+      if (it.video_id.startsWith("apple:")) {
+        const resolved = await api.resolveChart(it.title, it.channel ?? undefined);
+        if (!resolved) {
+          toast({ variant: "warning", message: `找不到可播放的版本 - ${it.title}` });
+          return;
+        }
+        target = resolved;
+      }
       await api.addToQueue(roomId, {
-        video_id: s.video_id,
-        title: s.title,
-        duration_sec: s.duration_sec,
-        thumbnail_url: s.thumbnail_url,
-        channel: s.channel,
+        video_id: target.video_id,
+        title: target.title,
+        duration_sec: target.duration_sec ?? null,
+        thumbnail_url: target.thumbnail_url ?? null,
+        channel: target.channel ?? null,
         nickname: confirmedNick,
         user_id: id?.user_id,
         vocal_mode: vocalMode,
         performance_mode: performanceMode,
+        duet_partner_user_id: duetPartner?.user_id ?? null,
+        duet_partner_nickname: duetPartner?.nickname ?? null,
         dedicate_to_nickname: dedicateTo || null,
       });
-      toast({ variant: "success", message: `✓ 已加入 - ${s.title}` });
+      toast({ variant: "success", message: `✓ 已加入 - ${target.title}` });
+    } catch (e: any) {
+      toast({ variant: "error", message: e?.message || "點播失敗" });
+    }
+  }, [confirmedNick, roomId, vocalMode, performanceMode, participants, duetPartnerId, dedicateTo, toast]);
+
+  const addSong = useCallback(async (s: SearchResult) => {
+    if (!confirmedNick || addingId) return;
+    setAddingId(s.video_id);
+    try {
+      await addByVideo(s);
     } catch (e: any) {
       toast({ variant: "error", message: e.message || "點播失敗" });
     } finally {
       setTimeout(() => setAddingId(null), 200);
     }
-  }, [confirmedNick, roomId, vocalMode, performanceMode, dedicateTo, addingId, toast]);
+  }, [confirmedNick, addingId, addByVideo, toast]);
+
+  // Favorites: surfaced in the Discover panel + a ♥ toggle on search results.
+  const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!confirmedNick) return;
+    const uid = getIdentity()?.user_id;
+    if (!uid) return;
+    api.getFavorites(uid)
+      .then((rows) => setFavorites(new Set(rows.map((r) => r.video_id))))
+      .catch(() => {});
+  }, [confirmedNick]);
+
+  const toggleFavorite = useCallback((video_id: string, title: string) => {
+    const uid = getIdentity()?.user_id;
+    if (!uid) return;
+    setFavorites((prev) => {
+      const next = new Set(prev);
+      if (next.has(video_id)) {
+        next.delete(video_id);
+        void api.removeFavorite(uid, video_id).catch(() => {});
+      } else {
+        next.add(video_id);
+        void api.addFavorite(uid, video_id, title).catch(() => {});
+        toast({ variant: "success", message: `♥ 已收藏 - ${title}` });
+      }
+      return next;
+    });
+  }, [toast]);
 
   const isMine = useCallback((item: QueueItem): boolean => {
     const myId = getIdentity()?.user_id;
@@ -540,9 +612,64 @@ function PhonePageContent() {
           </div>
         </div>
         )}
+
+        {!isSinger && (
+          <div className="flex flex-col gap-2">
+            <div className="flex bg-white/5 p-1 rounded-xl border border-white/5">
+              {([["solo", "獨唱"], ["duet", "對唱"], ["chorus", "合唱"]] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={cn(
+                    "flex-1 py-2 text-sm font-bold rounded-lg transition-colors",
+                    performanceMode === mode ? "bg-ktv-accent text-white shadow-md" : "text-white/60",
+                  )}
+                  onClick={() => setPerformanceMode(mode)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {performanceMode === "duet" && (
+              <select
+                aria-label="對唱夥伴"
+                className="bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white"
+                value={duetPartnerId}
+                onChange={(e) => setDuetPartnerId(e.target.value)}
+              >
+                <option value="">選擇對唱夥伴…</option>
+                {participants
+                  .filter((p) => p.user_id && p.user_id !== getIdentity()?.user_id)
+                  .map((p) => (
+                    <option key={p.user_id} value={p.user_id}>
+                      {p.nickname || p.user_id}
+                    </option>
+                  ))}
+              </select>
+            )}
+          </div>
+        )}
       </section>
 
+      {/* Discover: favorites / hot charts / recommendations */}
+      <DiscoverPanel
+        userId={getIdentity()?.user_id}
+        playingVideoId={playing?.video_id}
+        onAdd={addByVideo}
+        favorites={favorites}
+        onToggleFavorite={toggleFavorite}
+      />
+
       {/* Search results */}
+      {hasSearched && !searching && results.length === 0 && (
+        <div className="px-4 mt-8">
+          <div className="py-10 flex flex-col items-center justify-center bg-white/5 rounded-2xl border border-white/5 border-dashed text-center">
+            <div className="text-4xl mb-2 opacity-50">🔍</div>
+            <div className="text-white/60 font-medium">找不到相關歌曲</div>
+            <div className="text-white/40 text-xs mt-1">換個關鍵字，或試試上方探索榜單</div>
+          </div>
+        </div>
+      )}
       <AnimatePresence>
         {results.length > 0 && (
           <motion.section 
@@ -583,9 +710,20 @@ function PhonePageContent() {
                         {r.channel || "未知"}
                       </div>
                     </div>
-                    <Button 
-                      onClick={() => addSong(r)} 
-                      variant="primary" 
+                    <IconButton
+                      aria-label="收藏"
+                      variant="ghost"
+                      className="shrink-0 w-9 h-9"
+                      icon={
+                        <span className={cn("text-base", favorites.has(r.video_id) ? "text-ktv-accent" : "text-white/30")}>
+                          {favorites.has(r.video_id) ? "♥" : "♡"}
+                        </span>
+                      }
+                      onClick={() => toggleFavorite(r.video_id, r.title)}
+                    />
+                    <Button
+                      onClick={() => addSong(r)}
+                      variant="primary"
                       size="sm"
                       loading={addingId === r.video_id}
                       className="shrink-0 shadow-lg shadow-ktv-accent/20"
