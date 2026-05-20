@@ -44,14 +44,19 @@ export default function TvPage() {
   const [emojiTrigger, setEmojiTrigger] = useState<{ kind: string; ts: number } | null>(null);
   const [comboTrigger, setComboTrigger] = useState<ComboTrigger>(null);
   const [presenceTrigger, setPresenceTrigger] = useState<PresenceEvent>(null);
+  const [barrages, setBarrages] = useState<Array<{ id: number; text: string }>>([]);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [score, setScore] = useState<ScoreState>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const [lyricsExpanded, setLyricsExpanded] = useState(false);
+  const [theme, setTheme] = useState("cashbox-green");
   // Sync nudge: positive value makes lyrics appear earlier (compensates intro padding
   // on YouTube uploads vs. lrclib's album-master timing). Re-zeroed per song.
   const [lyricOffsetSec, setLyricOffsetSec] = useState(0);
   const [lyricClockSec, setLyricClockSec] = useState(0);
+  const [annoOn, setAnnoOn] = useState(false);
+  const [annoLang, setAnnoLang] = useState<"zh" | "ja">("zh");
+  const [annoMap, setAnnoMap] = useState<Record<string, string>>({});
   const [activeLyricIdx, setActiveLyricIdx] = useState(-1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -194,6 +199,43 @@ export default function TvPage() {
         return;
       }
 
+      if (m.event === "insert_top") {
+        setQueue(m.data.queue || []);
+        setPresenceTrigger({
+          kind: "joined",
+          nickname: m.data?.message || "有人插播了一首",
+          ts: Date.now(),
+        });
+        return;
+      }
+
+      if (m.event === "chat.message") {
+        if (m.data?.kind === "emoji") {
+          setEmojiTrigger({ kind: "atmosphere.clap", ts: Date.now() });
+        } else if (m.data?.message) {
+          const text = `${m.data.nickname || "匿名"}: ${m.data.message}`;
+          setBarrages((prev) => [...prev.slice(-5), { id: Date.now(), text }]);
+        }
+        return;
+      }
+
+      if (m.event === "room.theme" && m.data?.theme) {
+        setTheme(String(m.data.theme));
+        return;
+      }
+
+      if (m.event === "room.countdown") {
+        const sec = Number(m.data?.remaining_sec || 0);
+        const min = Math.max(1, Math.round(sec / 60));
+        setPresenceTrigger({ kind: "joined", nickname: `剩餘 ${min} 分鐘`, ts: Date.now() });
+        return;
+      }
+
+      if (m.event === "room.extended") {
+        setPresenceTrigger({ kind: "joined", nickname: `已續鐘 ${m.data?.minutes || 0} 分`, ts: Date.now() });
+        return;
+      }
+
       if (m.event === "lyric.nudge") {
         const current = playingRef.current;
         if (current && m.data.item_id === current.id && typeof m.data.delta_sec === "number") {
@@ -212,6 +254,12 @@ export default function TvPage() {
   // previous song's lyrics don't linger, and guard against a late response
   // for the previous song stomping the current one.
   useEffect(() => {
+    if (!barrages.length) return;
+    const t = setTimeout(() => setBarrages((prev) => prev.slice(1)), 2600);
+    return () => clearTimeout(t);
+  }, [barrages]);
+
+  useEffect(() => {
     if (!playingVideoId) {
       setStream(null);
       setLyrics(null);
@@ -227,7 +275,15 @@ export default function TvPage() {
     api.getLyrics(myId, playingTitle).then((l) => {
       if (fetchTokenRef.current === myId) setLyrics(l);
     }).catch(console.error);
-  }, [playingVideoId, playingTitle]);
+    api.getPronunciation(myId, annoLang).then((r) => {
+      if (fetchTokenRef.current !== myId) return;
+      const map: Record<string, string> = {};
+      r.items.forEach((it) => {
+        if (it.text && it.anno && !map[it.text]) map[it.text] = it.anno;
+      });
+      setAnnoMap(map);
+    }).catch(() => setAnnoMap({}));
+  }, [playingVideoId, playingTitle, annoLang]);
 
   // Auto-attach ended handler. (currentTime is read in the rAF tick below, not
   // via timeupdate, since timeupdate only fires ~4Hz on most browsers.)
@@ -243,8 +299,19 @@ export default function TvPage() {
       // overdue songs even without a healthy TV.
       wsRef.current?.send("playback.endHint", { item_id: itemId });
     };
+    const onTimeForOutro = () => {
+      const outroTrim = Math.max(0, stream.outro_trim_sec || 0);
+      if (!outroTrim || !Number.isFinite(v.duration) || v.duration <= 0) return;
+      if (v.currentTime >= Math.max(0, v.duration - outroTrim)) {
+        wsRef.current?.send("playback.endHint", { item_id: itemId, auto_trim: true });
+      }
+    };
     v.addEventListener("ended", onEnded);
-    return () => v.removeEventListener("ended", onEnded);
+    v.addEventListener("timeupdate", onTimeForOutro);
+    return () => {
+      v.removeEventListener("ended", onEnded);
+      v.removeEventListener("timeupdate", onTimeForOutro);
+    };
   }, [stream, playing?.id]);
 
   // Coordinated start: load video + (optional) external audio together and
@@ -260,7 +327,8 @@ export default function TvPage() {
     const audioUrl = externalAudioUrl;
     const useAudio = !!(a && audioUrl);
     const sameSong = lastVideoIdRef.current === stream.video_id;
-    const resumeAt = sameSong ? v.currentTime : 0;
+    const introTrim = Math.max(0, stream.intro_trim_sec || 0);
+    const resumeAt = sameSong ? Math.max(introTrim, v.currentTime) : introTrim;
     const wasPlaying = sameSong && !v.paused;
     v.pause();
     v.preload = "auto";
@@ -350,6 +418,24 @@ export default function TvPage() {
     v.muted = !!externalAudioUrl;
   }, [externalAudioUrl]);
 
+  // Force fade-out for long videos (over 6 min), avoid hard cut on transition.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const onTime = () => {
+      const remain = 360 - v.currentTime;
+      if (remain <= 8 && remain > 0) {
+        v.volume = Math.max(0, Math.min(1, remain / 8));
+      } else if (remain <= 0) {
+        v.volume = 0;
+      } else {
+        v.volume = 1;
+      }
+    };
+    v.addEventListener("timeupdate", onTime);
+    return () => v.removeEventListener("timeupdate", onTime);
+  }, []);
+
   // Sync external audio track with video time (DASH split / instrumental).
   // Three layers of stutter-avoidance:
   //   1. Settle window — for the first 3s after coordinated start, never seek
@@ -431,7 +517,7 @@ export default function TvPage() {
     }, 1000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timer?.started_at, timer?.rate_per_minute]);
+  }, [timer]);
 
   async function startTimer() {
     setTimer(await api.startTimer(roomId));
@@ -521,12 +607,36 @@ export default function TvPage() {
     });
   }
 
+  const themeClass =
+    theme === "star-purple"
+      ? "bg-[#170f2a]"
+      : theme === "holiday-blue"
+        ? "bg-[#0b1730]"
+        : theme === "retro"
+          ? "bg-[#2a1a0f]"
+          : theme === "dark"
+            ? "bg-black"
+            : "bg-ktv-bg";
+
   return (
-    <main className="min-h-screen flex flex-col bg-ktv-bg text-white">
+    <main className={`min-h-screen flex flex-col text-white transition-colors duration-300 ${themeClass}`}>
       <Atmosphere trigger={atmosphere} />
       <FloatingEmoji trigger={emojiTrigger} />
       <ComboEffect trigger={comboTrigger} />
       <PresenceToast trigger={presenceTrigger} />
+      <div className="fixed top-20 left-0 right-0 pointer-events-none z-40 space-y-2 px-4">
+        {barrages.map((b) => (
+          <motion.div
+            key={b.id}
+            initial={{ x: 300, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: -300, opacity: 0 }}
+            className="ml-auto w-fit max-w-[70%] rounded-full bg-black/55 px-4 py-1 text-sm text-white/90"
+          >
+            {b.text}
+          </motion.div>
+        ))}
+      </div>
       <ScoreScreen
         visible={!!score}
         songTitle={score?.songTitle || ""}
@@ -554,24 +664,32 @@ export default function TvPage() {
             <span className="text-white/50">Online </span>
             <span className="font-mono text-lg text-ktv-mic">{participants.length}</span>
           </div>
-          <button className="btn-ghost" onClick={() => setQueueOpen((v) => !v)}>
+          <button type="button" className="btn-ghost" onClick={() => setQueueOpen((v) => !v)}>
             Queue ({queue.length})
           </button>
           {!timer?.started_at ? (
-            <button className="btn-primary" onClick={startTimer}>開始計費</button>
+            <button type="button" className="btn-primary" onClick={startTimer}>開始計費</button>
           ) : (
-            <button className="btn-ghost" onClick={resetTimer}>重置</button>
+            <button type="button" className="btn-ghost" onClick={resetTimer}>重置</button>
           )}
-          <button className="btn-ghost" onClick={skipSong}>下一首</button>
+          <button type="button" className="btn-ghost" onClick={skipSong}>下一首</button>
           <button
+            type="button"
             className="btn-ghost"
             onClick={() => setLyricsExpanded((v) => !v)}
             title="切換歌詞大小"
           >
             {lyricsExpanded ? "縮小歌詞" : "放大歌詞"}
           </button>
+          <button type="button" className="btn-ghost" onClick={() => setAnnoOn((v) => !v)}>
+            {annoOn ? "關標註" : "注/拼"}
+          </button>
+          <button type="button" className="btn-ghost" onClick={() => setAnnoLang((v) => (v === "zh" ? "ja" : "zh"))}>
+            {annoLang.toUpperCase()}
+          </button>
           {playing && (
             <button
+              type="button"
               className="btn-ghost"
               onClick={() => {
                 setLyrics(null);
@@ -587,19 +705,19 @@ export default function TvPage() {
           )}
           {playing && lyrics?.lines.length ? (
             <div className="flex items-center gap-1 text-sm" title="歌詞時間微調 (此曲記住)">
-              <button className="btn-ghost px-2" onClick={() => nudgeOffset(-1.0)} title="歌詞慢 1 秒">
+              <button type="button" className="btn-ghost px-2" onClick={() => nudgeOffset(-1.0)} title="歌詞慢 1 秒">
                 ⏮
               </button>
-              <button className="btn-ghost px-2" onClick={() => nudgeOffset(-0.3)} title="歌詞慢 0.3 秒">
+              <button type="button" className="btn-ghost px-2" onClick={() => nudgeOffset(-0.3)} title="歌詞慢 0.3 秒">
                 ⏪
               </button>
               <span className="font-mono text-xs text-ktv-gold w-14 text-center">
                 {lyricOffsetSec >= 0 ? "+" : ""}{lyricOffsetSec.toFixed(1)}s
               </span>
-              <button className="btn-ghost px-2" onClick={() => nudgeOffset(0.3)} title="歌詞快 0.3 秒">
+              <button type="button" className="btn-ghost px-2" onClick={() => nudgeOffset(0.3)} title="歌詞快 0.3 秒">
                 ⏩
               </button>
-              <button className="btn-ghost px-2" onClick={() => nudgeOffset(1.0)} title="歌詞快 1 秒">
+              <button type="button" className="btn-ghost px-2" onClick={() => nudgeOffset(1.0)} title="歌詞快 1 秒">
                 ⏭
               </button>
             </div>
@@ -615,6 +733,7 @@ export default function TvPage() {
             <>
               <div className="relative bg-black flex-1 min-h-0">
                 {/* src is set imperatively in an effect so URL refreshes don't reset currentTime */}
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                 <video
                   ref={videoRef}
                   autoPlay
@@ -625,13 +744,20 @@ export default function TvPage() {
                   // racing the autoplay policy and could leave the element paused.
                   muted={!!externalAudioUrl}
                   className="w-full h-full object-contain"
-                />
+                >
+                  <track kind="captions" srcLang="zh" label="lyrics" src="data:text/vtt,WEBVTT" default />
+                </video>
                 {externalAudioUrl && (
-                  <audio ref={audioRef} preload="auto" />
+                  <audio ref={audioRef} preload="auto">
+                    <track kind="captions" srcLang="zh" label="lyrics" src="data:text/vtt,WEBVTT" default />
+                  </audio>
                 )}
                 <div className="absolute top-4 left-4 panel px-3 py-1 text-sm">
                   <span className="text-ktv-gold font-bold">{playing.title}</span>
                   <span className="text-white/60 ml-2">@{playing.nickname}</span>
+                  {playing.dedicate_to_nickname && (
+                    <span className="ml-2 pill bg-ktv-accent text-white">來自點播給 {playing.dedicate_to_nickname}</span>
+                  )}
                   {playing.vocal_mode === "instrumental" && (
                     <span className="ml-2 pill bg-ktv-mic text-black">伴奏</span>
                   )}
@@ -691,6 +817,9 @@ export default function TvPage() {
                           }`}
                         >
                           {lyrics.lines[activeLyricIdx + 1].text}
+                          {annoOn && annoMap[lyrics.lines[activeLyricIdx + 1].text] && (
+                            <div className="text-xs text-white/50 mt-1">{annoMap[lyrics.lines[activeLyricIdx + 1].text]}</div>
+                          )}
                         </div>
                       )}
                     </>

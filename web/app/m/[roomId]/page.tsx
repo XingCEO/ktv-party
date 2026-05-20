@@ -25,8 +25,11 @@ function PhonePageContent() {
   const [searching, setSearching] = useState(false);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [vocalMode, setVocalMode] = useState<"original" | "instrumental">("original");
+  const [performanceMode, setPerformanceMode] = useState<"solo" | "duet" | "chorus">("solo");
+  const [dedicateTo, setDedicateTo] = useState("");
   const [reconnecting, setReconnecting] = useState(false);
   const [addingId, setAddingId] = useState<string | null>(null);
+  const [chatText, setChatText] = useState("");
   
   const wsRef = useRef<RoomSocket | null>(null);
   const toast = useToast();
@@ -59,6 +62,16 @@ function PhonePageContent() {
       }
       if (m.event === "queue.added" || m.event === "queue.removed" || m.event === "queue.reordered" || m.event === "playback.advanced" || m.event === "queue.vocal_mode.updated") {
         handleQueueUpdate(m.data.queue || []);
+      }
+      if (m.event === "insert_top") {
+        handleQueueUpdate(m.data.queue || []);
+        if (m.data?.message) toast({ variant: "success", message: String(m.data.message) });
+      }
+      if (m.event === "vote_skip") {
+        toast({ variant: "warning", message: `投票切歌 ${m.data.votes}/${m.data.threshold}` });
+      }
+      if (m.event === "chat.message" && m.data?.kind === "emoji") {
+        toast({ variant: "success", message: `${m.data.nickname}: ${m.data.message}` });
       }
       if (m.event === "vocal_removal.ready") {
         toast({ variant: "success", title: "✨ 消音完成", message: `已準備好伴奏: ${m.data.video_id}` });
@@ -122,6 +135,8 @@ function PhonePageContent() {
         nickname: confirmedNick,
         user_id: id?.user_id,
         vocal_mode: vocalMode,
+        performance_mode: performanceMode,
+        dedicate_to_nickname: dedicateTo || null,
       });
       toast({ variant: "success", message: `✓ 已加入 - ${s.title}` });
     } catch (e: any) {
@@ -129,7 +144,7 @@ function PhonePageContent() {
     } finally {
       setTimeout(() => setAddingId(null), 200);
     }
-  }, [confirmedNick, roomId, vocalMode, addingId, toast]);
+  }, [confirmedNick, roomId, vocalMode, performanceMode, dedicateTo, addingId, toast]);
 
   const isMine = useCallback((item: QueueItem): boolean => {
     const myId = getIdentity()?.user_id;
@@ -151,12 +166,35 @@ function PhonePageContent() {
     wsRef.current?.send(`atmosphere.${kind}`, { from: confirmedNick, ts: Date.now() });
   }, [confirmedNick]);
 
+  const sendChat = useCallback((kind: "text" | "emoji" = "text", message?: string) => {
+    const m = (message ?? chatText).trim();
+    if (!m) return;
+    wsRef.current?.send("chat.send", {
+      user_id: getIdentity()?.user_id,
+      nickname: confirmedNick,
+      kind,
+      message: m,
+    });
+    if (kind === "text") setChatText("");
+  }, [chatText, confirmedNick]);
+
   const myCount = useMemo(
     () => queue.filter((x) => x.status !== "done" && isMine(x)).length,
     [queue, isMine],
   );
 
   const myQueueItems = useMemo(() => queue.filter(x => isMine(x)), [queue, isMine]);
+  const myNext = useMemo(() => {
+    const queuedMine = queue
+      .filter((q) => isMine(q) && q.status === "queued")
+      .sort((a, b) => a.position - b.position);
+    const next = queuedMine[0];
+    if (!next) return null;
+    const aheadSec = queue
+      .filter((q) => q.status !== "done" && q.position < next.position)
+      .reduce((acc, q) => acc + (q.duration_sec || 0), 0);
+    return { position: next.position, etaMin: Math.max(1, Math.round(aheadSec / 60)) };
+  }, [queue, isMine]);
 
   const playing = useMemo(() => queue.find((q) => q.status === "playing") || null, [queue]);
   const isSinger = useMemo(() => {
@@ -186,7 +224,7 @@ function PhonePageContent() {
     }
     const t = setInterval(() => setElapsedSec(prev => prev + 1), 1000);
     return () => clearInterval(t);
-  }, [isSinger, playing?.id]);
+  }, [isSinger]);
 
   const [localOffset, setLocalOffset] = useState<number>(0);
   useEffect(() => {
@@ -199,9 +237,10 @@ function PhonePageContent() {
   const nudgeLyric = useCallback((delta: number) => {
     if (!playing) return;
     setLocalOffset((v) => {
-      const next = Math.round((v + delta) * 10) / 10;
+      const next = Math.max(-2, Math.min(2, Math.round((v + delta) * 10) / 10));
       try { window.localStorage.setItem(`ktv-lyric-offset-${playing.video_id}`, String(next)); } catch {}
       wsRef.current?.send("lyric.nudge", { item_id: playing.id, delta_sec: delta });
+      void api.setLyricOffset(playing.video_id, next).catch(() => {});
       return next;
     });
   }, [playing]);
@@ -219,12 +258,21 @@ function PhonePageContent() {
     if (!playing) return;
     if (confirm("確定要跳過下一首嗎？")) {
       try {
-        await api.playbackNext(roomId);
+        const uid = getIdentity()?.user_id;
+        wsRef.current?.send("skip_current", { user_id: uid });
       } catch (e: any) {
         toast({ variant: "error", message: e.message || "跳過失敗" });
       }
     }
-  }, [playing, roomId, toast]);
+  }, [playing, toast]);
+
+  const insertTop = useCallback((itemId: number) => {
+    wsRef.current?.send("insert_top", { item_id: itemId, user_id: getIdentity()?.user_id });
+  }, []);
+
+  const voteSkip = useCallback(() => {
+    wsRef.current?.send("skip_current", { user_id: getIdentity()?.user_id });
+  }, []);
 
 
   if (!confirmedNick) {
@@ -290,6 +338,11 @@ function PhonePageContent() {
                 </Badge>
               )}
             </div>
+            {myNext && (
+              <div className="text-[11px] text-white/55">
+                下一首第 {myNext.position} 位，約 {myNext.etaMin} 分鐘
+              </div>
+            )}
           </div>
           <IconButton
             icon={<span className="text-xl">🔄</span>}
@@ -320,18 +373,41 @@ function PhonePageContent() {
                 {/* Vocal Toggle */}
                 <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 relative">
                   <button
+                    type="button"
                     className={cn("flex-1 py-2 text-sm font-bold rounded-lg transition-colors", playing.vocal_mode === "original" ? "bg-ktv-gold text-ktv-bg shadow-md" : "text-white/70")}
                     onClick={() => toggleSingerVocalMode("original")}
                   >
                     🎵 原唱
                   </button>
                   <button
+                    type="button"
                     className={cn("flex-1 py-2 text-sm font-bold rounded-lg transition-colors", playing.vocal_mode === "instrumental" ? "bg-ktv-mic text-ktv-bg shadow-md" : "text-white/70")}
                     onClick={() => toggleSingerVocalMode("instrumental")}
                   >
                     🎤 伴奏
                   </button>
                 </div>
+
+                <div className="flex items-center gap-2">
+                  <label htmlFor="performance-mode" className="text-xs text-white/50">模式</label>
+                  <select
+                    id="performance-mode"
+                    className="bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-xs"
+                    value={performanceMode}
+                    onChange={(e) => setPerformanceMode(e.target.value as "solo" | "duet" | "chorus")}
+                  >
+                    <option value="solo">獨唱</option>
+                    <option value="duet">對唱</option>
+                    <option value="chorus">合唱</option>
+                  </select>
+                </div>
+
+                <Input
+                  value={dedicateTo}
+                  onChange={(e) => setDedicateTo(e.target.value)}
+                  placeholder="點播給誰（可選）"
+                  className="h-9 bg-white/5 border-white/10"
+                />
 
                 {/* Lyric Offset */}
                 <div className="flex items-center justify-between bg-white/5 p-2 rounded-xl border border-white/5">
@@ -344,10 +420,61 @@ function PhonePageContent() {
                     <IconButton variant="ghost" aria-label="+1s" icon={<span className="text-xs">+1s</span>} onClick={() => nudgeLyric(1)} className="w-8 h-8 rounded-full" />
                   </div>
                 </div>
+                <input
+                  type="range"
+                  min={-2}
+                  max={2}
+                  step={0.1}
+                  value={localOffset}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    const delta = next - localOffset;
+                    if (Math.abs(delta) > 0.0001) nudgeLyric(delta);
+                  }}
+                />
 
                 {/* Skip */}
-                <Button variant="danger" className="w-full mt-1" onClick={skipMySong}>
-                  跳過下一首
+                <div className="grid grid-cols-2 gap-2">
+                  <Button variant="danger" className="w-full mt-1" onClick={skipMySong}>
+                    房主切歌
+                  </Button>
+                  <Button variant="ghost" className="w-full mt-1" onClick={voteSkip}>
+                    投票切歌
+                  </Button>
+                </div>
+                <Button
+                  variant="ghost"
+                  className="w-full"
+                  onClick={() => {
+                    const corrected = prompt("歌詞校正：請輸入正確歌詞");
+                    if (!corrected || !playing) return;
+                    api.reportLyricsCorrection(playing.video_id, {
+                      corrected_text: corrected,
+                      user_id: getIdentity()?.user_id,
+                    }).then(() => toast({ variant: "success", message: "已送出歌詞校正" })).catch(() => {});
+                  }}
+                >
+                  回報歌詞錯誤
+                </Button>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button variant="ghost" className="w-full" onClick={() => api.setSkipMode(roomId, "owner").catch(() => {})}>
+                    房主模式
+                  </Button>
+                  <Button variant="ghost" className="w-full" onClick={() => api.setSkipMode(roomId, "vote").catch(() => {})}>
+                    投票模式
+                  </Button>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <Button variant="ghost" className="w-full" onClick={() => api.setTheme(roomId, "cashbox-green").catch(() => {})}>綠</Button>
+                  <Button variant="ghost" className="w-full" onClick={() => api.setTheme(roomId, "star-purple").catch(() => {})}>紫</Button>
+                  <Button variant="ghost" className="w-full" onClick={() => api.setTheme(roomId, "holiday-blue").catch(() => {})}>藍</Button>
+                </div>
+                <Button
+                  variant="gold"
+                  className="w-full"
+                  onClick={() => api.extendRoom(roomId, 30).then(() => toast({ variant: "success", message: "已續鐘 30 分" })).catch(() => {})}
+                >
+                  ⏰ 續鐘 +30 分
                 </Button>
               </div>
             </Card>
@@ -375,6 +502,7 @@ function PhonePageContent() {
           <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 relative">
           <div className="flex-1 relative z-10">
             <button
+              type="button"
               className={cn(
                 "w-full py-2 text-sm font-bold rounded-lg transition-colors relative",
                 vocalMode === "original" ? "text-ktv-bg" : "text-white/70"
@@ -393,6 +521,7 @@ function PhonePageContent() {
           </div>
           <div className="flex-1 relative z-10">
             <button
+              type="button"
               className={cn(
                 "w-full py-2 text-sm font-bold rounded-lg transition-colors relative",
                 vocalMode === "instrumental" ? "text-ktv-bg" : "text-white/70"
@@ -534,13 +663,22 @@ function PhonePageContent() {
                         </div>
                       </div>
                       {isMine(it) && it.status !== "playing" && (
-                        <IconButton
-                          icon={<span className="text-sm">✕</span>}
-                          aria-label="移除點播"
-                          variant="ghost"
-                          className="text-white/30 hover:text-ktv-accent hover:bg-ktv-accent/10 shrink-0"
-                          onClick={() => removeSong(it)}
-                        />
+                        <div className="flex items-center gap-1">
+                          <IconButton
+                            icon={<span className="text-sm">↑</span>}
+                            aria-label="插播下一首"
+                            variant="ghost"
+                            className="text-white/30 hover:text-ktv-gold hover:bg-ktv-gold/10 shrink-0"
+                            onClick={() => insertTop(it.id)}
+                          />
+                          <IconButton
+                            icon={<span className="text-sm">✕</span>}
+                            aria-label="移除點播"
+                            variant="ghost"
+                            className="text-white/30 hover:text-ktv-accent hover:bg-ktv-accent/10 shrink-0"
+                            onClick={() => removeSong(it)}
+                          />
+                        </div>
                       )}
                     </CardBody>
                   </Card>
@@ -553,31 +691,45 @@ function PhonePageContent() {
 
       {/* Atmosphere bar */}
       <nav className="fixed bottom-0 inset-x-0 z-30 bg-ktv-panel/90 backdrop-blur-xl border-t border-white/10 pt-3 pb-safe-bottom shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+        <div className="max-w-sm mx-auto px-4 mb-2 flex gap-2">
+          <Input
+            value={chatText}
+            onChange={(e) => setChatText(e.target.value)}
+            placeholder="發送彈幕訊息..."
+            className="h-10 bg-white/5 border-white/10"
+          />
+          <Button variant="ghost" onClick={() => sendChat("text")}>送出</Button>
+          <Button variant="ghost" onClick={() => sendChat("emoji", "🔥")}>🔥</Button>
+        </div>
         <div className="flex justify-around max-w-sm mx-auto px-4 relative pb-3">
           <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-2 bg-ktv-panel text-[10px] text-white/40 uppercase tracking-widest font-bold rounded-full">氣氛特效</div>
           
-          <button 
+          <button
+            type="button"
             onClick={() => sendAtmosphere("clap")} 
             className="w-14 h-14 rounded-full bg-white/5 hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all flex items-center justify-center text-2xl shadow-lg border border-white/5 group"
             aria-label="拍手"
           >
             <span className="group-hover:-translate-y-1 transition-transform">👏</span>
           </button>
-          <button 
+          <button
+            type="button"
             onClick={() => sendAtmosphere("confetti")} 
             className="w-14 h-14 rounded-full bg-white/5 hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all flex items-center justify-center text-2xl shadow-lg border border-white/5 group"
             aria-label="彩帶"
           >
             <span className="group-hover:-translate-y-1 transition-transform">🎊</span>
           </button>
-          <button 
+          <button
+            type="button"
             onClick={() => sendAtmosphere("fireworks")} 
             className="w-14 h-14 rounded-full bg-white/5 hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all flex items-center justify-center text-2xl shadow-lg border border-white/5 group"
             aria-label="煙火"
           >
             <span className="group-hover:-translate-y-1 transition-transform">🎆</span>
           </button>
-          <button 
+          <button
+            type="button"
             onClick={() => sendAtmosphere("birthday")} 
             className="w-14 h-14 rounded-full bg-white/5 hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all flex items-center justify-center text-2xl shadow-lg border border-white/5 group"
             aria-label="生日"

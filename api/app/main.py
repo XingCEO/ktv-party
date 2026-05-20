@@ -3,11 +3,14 @@
 Wires REST + WebSocket routes for the KTV system. All long-running operations
 delegate to background tasks; HTTP handlers stay thin.
 """
+
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+import unicodedata
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,10 +30,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import queue as queue_repo
 from . import rooms as rooms_repo
 from .config import get_settings
-from .db import init_db
+from .db import get_conn, init_db
 from .schemas import (
     HealthResponse,
     LyricsResponse,
+    LyricOffsetUpdate,
     QueueAdd,
     QueueItem,
     QueueReorder,
@@ -41,7 +45,7 @@ from .schemas import (
     StreamInfo,
     VocalModeUpdate,
 )
-from .services import audio_simple, demucs_worker, lyrics, youtube, scheduler
+from .services import audio_simple, demucs_worker, lyrics, youtube, scheduler, metadata
 from .services.youtube import (
     YoutubeError,
     YoutubeRateLimited,
@@ -57,11 +61,15 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 VERSION = "0.1.0"
+MAX_PLAY_SEC = 360
 
 # (kind, ts) tuples per room, last 4s only.
-_ATMOSPHERE_TRACKER: defaultdict[str, deque[tuple[str, float]]] = defaultdict(lambda: deque(maxlen=20))
+_ATMOSPHERE_TRACKER: defaultdict[str, deque[tuple[str, float]]] = defaultdict(
+    lambda: deque(maxlen=20)
+)
 COMBO_THRESHOLD = 5
 COMBO_WINDOW_SEC = 4.0
+
 
 def _record_atmosphere_and_check_combo(room_id: str, kind: str) -> int | None:
     """Returns combo count if threshold reached, else None."""
@@ -69,9 +77,7 @@ def _record_atmosphere_and_check_combo(room_id: str, kind: str) -> int | None:
     tracker = _ATMOSPHERE_TRACKER[room_id]
     tracker.append((kind, now))
     # Count same-kind events within window
-    same_kind_recent = sum(
-        1 for k, t in tracker if k == kind and now - t <= COMBO_WINDOW_SEC
-    )
+    same_kind_recent = sum(1 for k, t in tracker if k == kind and now - t <= COMBO_WINDOW_SEC)
     if same_kind_recent >= COMBO_THRESHOLD:
         # Burn the tracker entries for this kind so we don't fire combo every time after threshold
         tracker.clear()
@@ -81,11 +87,13 @@ def _record_atmosphere_and_check_combo(room_id: str, kind: str) -> int | None:
 
 _BG_TASKS: set[asyncio.Task] = set()
 
+
 def _spawn_bg(coro) -> asyncio.Task:
     t = asyncio.create_task(coro)
     _BG_TASKS.add(t)
     t.add_done_callback(_BG_TASKS.discard)
     return t
+
 
 async def _prune_ws_loop() -> None:
     while True:
@@ -94,6 +102,7 @@ async def _prune_ws_loop() -> None:
             await broker.prune_stale()
         except Exception as exc:
             logger.exception("prune_stale loop error: %s", exc)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -209,6 +218,30 @@ async def reset_timer(room_id: str) -> RoomTimer:
     return timer
 
 
+@app.post("/api/rooms/{room_id}/ends-at", status_code=204)
+async def set_room_ends_at(room_id: str, payload: dict) -> None:
+    ends_at = payload.get("ends_at")
+    if ends_at is not None and not isinstance(ends_at, (int, float)):
+        raise HTTPException(400, "ends_at must be number or null")
+    if not rooms_repo.set_ends_at(room_id, float(ends_at) if ends_at is not None else None):
+        raise HTTPException(404, "room not found")
+    await safe_broadcast(room_id, "room.ends_at", {"ends_at": ends_at})
+
+
+@app.post("/api/rooms/{room_id}/extend", status_code=204)
+async def extend_room_time(room_id: str, payload: dict) -> None:
+    minutes = int(payload.get("minutes") or 0)
+    if minutes <= 0:
+        raise HTTPException(400, "minutes must be > 0")
+    room = rooms_repo.get_room(room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    base = getattr(room, "ends_at", None) or time.time()
+    next_ends_at = float(base) + minutes * 60
+    rooms_repo.set_ends_at(room_id, next_ends_at)
+    await safe_broadcast(room_id, "room.extended", {"ends_at": next_ends_at, "minutes": minutes})
+
+
 # ---------- queue ----------------------------------------------------------
 @app.get("/api/rooms/{room_id}/queue", response_model=list[QueueItem])
 async def get_queue(room_id: str, include_done: bool = False) -> list[QueueItem]:
@@ -221,12 +254,19 @@ async def get_queue(room_id: str, include_done: bool = False) -> list[QueueItem]
 async def add_to_queue(room_id: str, payload: QueueAdd) -> QueueItem:
     if not rooms_repo.get_room(room_id):
         raise HTTPException(404, "room not found")
-    item = queue_repo.add_to_queue(room_id, payload)
+    try:
+        item = queue_repo.add_to_queue(room_id, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     full = queue_repo.list_queue(room_id)
-    await safe_broadcast(room_id, "queue.added", {
-        "item": item.model_dump(),
-        "queue": [i.model_dump() for i in full],
-    })
+    await safe_broadcast(
+        room_id,
+        "queue.added",
+        {
+            "item": item.model_dump(),
+            "queue": [i.model_dump() for i in full],
+        },
+    )
     # Pre-warm instrumental if requested. Demucs (GPU/CPU ML) is preferred
     # when available; otherwise we fall back to ffmpeg center-channel
     # cancellation, which runs on any CPU and produces a usable karaoke track.
@@ -251,9 +291,14 @@ async def _prewarm_instrumental(room_id: str, video_id: str) -> None:
     try:
         existing = demucs_worker.find_existing_instrumental(video_id)
         if existing:
-            await safe_broadcast(room_id, "vocal_removal.ready", {
-                "video_id": video_id, "path": str(existing),
-            })
+            await safe_broadcast(
+                room_id,
+                "vocal_removal.ready",
+                {
+                    "video_id": video_id,
+                    "path": str(existing),
+                },
+            )
             return
         if demucs_worker.is_demucs_available():
             mp4 = await youtube.download_mp4(video_id)
@@ -262,26 +307,47 @@ async def _prewarm_instrumental(room_id: str, video_id: str) -> None:
         # No Demucs — use ffmpeg center-channel cancellation. This is fast
         # enough to run inline; no queue needed.
         produced = await audio_simple.make_karaoke(video_id)
-        await safe_broadcast(room_id, "vocal_removal.ready", {
-            "video_id": video_id, "path": str(produced),
-        })
+        await safe_broadcast(
+            room_id,
+            "vocal_removal.ready",
+            {
+                "video_id": video_id,
+                "path": str(produced),
+            },
+        )
     except Exception as exc:
         logger.warning("prewarm instrumental failed video_id=%s: %s", video_id, exc)
-        await safe_broadcast(room_id, "vocal_removal.failed", {
-            "video_id": video_id, "error": str(exc),
-        })
+        await safe_broadcast(
+            room_id,
+            "vocal_removal.failed",
+            {
+                "video_id": video_id,
+                "error": str(exc),
+            },
+        )
 
 
 def _on_demucs_complete(room_id: str):
     async def _cb(video_id: str, status: demucs_worker.JobStatus) -> None:
         if status.status == "done":
-            await safe_broadcast(room_id, "vocal_removal.ready", {
-                "video_id": video_id, "path": status.instrumental_path,
-            })
+            await safe_broadcast(
+                room_id,
+                "vocal_removal.ready",
+                {
+                    "video_id": video_id,
+                    "path": status.instrumental_path,
+                },
+            )
         else:
-            await safe_broadcast(room_id, "vocal_removal.failed", {
-                "video_id": video_id, "error": status.error,
-            })
+            await safe_broadcast(
+                room_id,
+                "vocal_removal.failed",
+                {
+                    "video_id": video_id,
+                    "error": status.error,
+                },
+            )
+
     return _cb
 
 
@@ -289,10 +355,14 @@ def _on_demucs_complete(room_id: str):
 async def remove_queue_item(room_id: str, item_id: int) -> None:
     if not queue_repo.remove_item(room_id, item_id):
         raise HTTPException(404, "queue item not found or is currently playing")
-    await safe_broadcast(room_id, "queue.removed", {
-        "item_id": item_id,
-        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
-    })
+    await safe_broadcast(
+        room_id,
+        "queue.removed",
+        {
+            "item_id": item_id,
+            "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+        },
+    )
 
 
 @app.patch("/api/rooms/{room_id}/queue", response_model=list[QueueItem])
@@ -301,9 +371,13 @@ async def reorder_queue(room_id: str, payload: QueueReorder) -> list[QueueItem]:
         items = queue_repo.reorder_queue(room_id, payload.item_ids)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    await safe_broadcast(room_id, "queue.reordered", {
-        "queue": [i.model_dump() for i in items],
-    })
+    await safe_broadcast(
+        room_id,
+        "queue.reordered",
+        {
+            "queue": [i.model_dump() for i in items],
+        },
+    )
     return items
 
 
@@ -311,19 +385,44 @@ async def reorder_queue(room_id: str, payload: QueueReorder) -> list[QueueItem]:
 async def insert_next(room_id: str, item_id: int) -> None:
     if not queue_repo.insert_next(room_id, item_id):
         raise HTTPException(404, "queue item not found")
-    await safe_broadcast(room_id, "queue.reordered", {
-        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
-    })
+    await safe_broadcast(
+        room_id,
+        "queue.reordered",
+        {
+            "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+        },
+    )
+
+
+@app.post("/api/rooms/{room_id}/skip-mode/{mode}", status_code=204)
+async def set_skip_mode(room_id: str, mode: str) -> None:
+    if mode not in {"owner", "vote"}:
+        raise HTTPException(400, "invalid mode")
+    if not rooms_repo.set_skip_mode(room_id, mode):
+        raise HTTPException(404, "room not found")
+    await safe_broadcast(room_id, "room.skip_mode", {"mode": mode})
+
+
+@app.post("/api/rooms/{room_id}/theme/{theme}", status_code=204)
+async def set_theme(room_id: str, theme: str) -> None:
+    if not rooms_repo.set_theme(room_id, theme):
+        raise HTTPException(404, "room not found")
+    await safe_broadcast(room_id, "room.theme", {"theme": theme})
 
 
 @app.patch("/api/rooms/{room_id}/queue/{item_id}/vocal-mode", status_code=204)
 async def update_vocal_mode(room_id: str, item_id: int, payload: VocalModeUpdate) -> None:
     if not queue_repo.set_vocal_mode(room_id, item_id, payload.vocal_mode):
         raise HTTPException(404, "queue item not found")
-    await safe_broadcast(room_id, "queue.vocal_mode.updated", {
-        "item_id": item_id, "vocal_mode": payload.vocal_mode,
-        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
-    })
+    await safe_broadcast(
+        room_id,
+        "queue.vocal_mode.updated",
+        {
+            "item_id": item_id,
+            "vocal_mode": payload.vocal_mode,
+            "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+        },
+    )
     # Mirror add_to_queue behavior — kick off vocal removal so the singer doesn't have
     # to wait when they actually press play. Toggling back to original is a no-op.
     if payload.vocal_mode == "instrumental" and (
@@ -341,24 +440,31 @@ async def update_vocal_mode(room_id: str, item_id: int, payload: VocalModeUpdate
 async def playback_next(room_id: str) -> Optional[QueueItem]:
     return await _advance_via_endpoint(room_id)
 
+
 async def _advance_via_endpoint(room_id: str) -> Optional[QueueItem]:
     item = queue_repo.advance_to_next(room_id)
     full = queue_repo.list_queue(room_id)
     next_starts_at = None
     if item and item.duration_sec:
         next_starts_at = time.time() + item.duration_sec
-    await safe_broadcast(room_id, "playback.advanced", {
-        "current": item.model_dump() if item else None,
-        "queue": [i.model_dump() for i in full],
-        "next_starts_at": next_starts_at,
-        "reason": "endpoint",
-    })
+    await safe_broadcast(
+        room_id,
+        "playback.advanced",
+        {
+            "current": item.model_dump() if item else None,
+            "queue": [i.model_dump() for i in full],
+            "next_starts_at": next_starts_at,
+            "reason": "endpoint",
+        },
+    )
     return item
 
 
 # ---------- search / stream / lyrics --------------------------------------
 @app.get("/api/search", response_model=list[SearchResult])
-async def search(q: str = Query(..., min_length=1), n: int = Query(10, ge=1, le=25)) -> list[SearchResult]:
+async def search(
+    q: str = Query(..., min_length=1), n: int = Query(10, ge=1, le=25)
+) -> list[SearchResult]:
     try:
         hits = await youtube.search(q, n=n)
     except YoutubeRateLimited as exc:
@@ -389,6 +495,14 @@ async def get_stream(video_id: str) -> StreamInfo:
     except Exception as exc:
         raise HTTPException(502, f"stream resolve failed: {exc}")
     instrumental = demucs_worker.find_existing_instrumental(video_id)
+    row = (
+        get_conn()
+        .execute(
+            "SELECT intro_trim_sec, outro_trim_sec FROM songs WHERE video_id = ?",
+            (video_id,),
+        )
+        .fetchone()
+    )
     return StreamInfo(
         video_id=video_id,
         video_url=info.video_url,
@@ -396,7 +510,69 @@ async def get_stream(video_id: str) -> StreamInfo:
         instrumental_url=f"/api/songs/{video_id}/instrumental/file" if instrumental else None,
         expires_at=info.expires_at,
         has_subs=bool(info.vtt_path),
+        intro_trim_sec=float(
+            row["intro_trim_sec"] if row and row["intro_trim_sec"] is not None else 0.0
+        ),
+        outro_trim_sec=float(
+            row["outro_trim_sec"] if row and row["outro_trim_sec"] is not None else 0.0
+        ),
     )
+
+
+@app.post("/api/songs/{video_id}/trim-auto", status_code=204)
+async def auto_trim(video_id: str, payload: dict) -> None:
+    duration_sec = int(payload.get("duration_sec") or 0)
+    if duration_sec <= 0:
+        raise HTTPException(400, "duration_sec required")
+    intro = round(min(15.0, max(0.0, duration_sec * 0.04)), 2)
+    outro = round(min(18.0, max(0.0, duration_sec * 0.05)), 2)
+    get_conn().execute(
+        "UPDATE songs SET intro_trim_sec = ?, outro_trim_sec = ? WHERE video_id = ?",
+        (intro, outro, video_id),
+    )
+
+
+@app.get("/api/songs/{video_id}/pronunciation")
+async def pronunciation(video_id: str, lang: str = "zh") -> dict:
+    row = (
+        get_conn()
+        .execute("SELECT lyrics_word_timing FROM songs WHERE video_id = ?", (video_id,))
+        .fetchone()
+    )
+    words = []
+    if row and row["lyrics_word_timing"]:
+        try:
+            words = json.loads(row["lyrics_word_timing"])
+        except Exception:
+            words = []
+    texts = [str(w.get("text") or "") for w in words if isinstance(w, dict)]
+    out: list[dict] = []
+    if lang == "zh":
+        try:
+            from pypinyin import lazy_pinyin, Style  # type: ignore
+
+            for i, t in enumerate(texts):
+                p = " ".join(lazy_pinyin(t, style=Style.TONE3))
+                out.append({"idx": i, "text": t, "anno": p})
+        except Exception:
+            for i, t in enumerate(texts):
+                out.append({"idx": i, "text": t, "anno": ""})
+    elif lang == "ja":
+        try:
+            from pykakasi import kakasi  # type: ignore
+
+            kks = kakasi()
+            conv = kks.convert
+            for i, t in enumerate(texts):
+                roma = " ".join([x.get("hepburn", "") for x in conv(t)])
+                out.append({"idx": i, "text": t, "anno": roma})
+        except Exception:
+            for i, t in enumerate(texts):
+                out.append({"idx": i, "text": t, "anno": ""})
+    else:
+        for i, t in enumerate(texts):
+            out.append({"idx": i, "text": t, "anno": unicodedata.normalize("NFKC", t)})
+    return {"video_id": video_id, "lang": lang, "items": out}
 
 
 @app.get("/api/songs/{video_id}/lyrics", response_model=LyricsResponse)
@@ -417,14 +593,251 @@ async def get_lyrics(
     # lrclib's exact-match /api/get is a lot more reliable with an artist hint.
     if not artist:
         from .db import get_conn
-        row = get_conn().execute(
-            "SELECT channel FROM songs WHERE video_id = ?", (video_id,),
-        ).fetchone()
+
+        row = (
+            get_conn()
+            .execute(
+                "SELECT channel FROM songs WHERE video_id = ?",
+                (video_id,),
+            )
+            .fetchone()
+        )
         if row and row["channel"]:
             artist = row["channel"]
-    return await lyrics.get_lyrics(
-        video_id, title=title, artist=artist, vtt_path=vtt_path, force=force,
+    resp = await lyrics.get_lyrics(
+        video_id,
+        title=title,
+        artist=artist,
+        vtt_path=vtt_path,
+        force=force,
     )
+    row2 = (
+        get_conn()
+        .execute(
+            "SELECT lyrics_word_timing, lyric_offset_sec FROM songs WHERE video_id = ?",
+            (video_id,),
+        )
+        .fetchone()
+    )
+    if row2:
+        if row2["lyrics_word_timing"]:
+            try:
+                resp.words = json.loads(row2["lyrics_word_timing"])
+            except Exception:
+                pass
+        resp.lyric_offset_sec = float(row2["lyric_offset_sec"] or 0.0)
+    if not resp.words and resp.lines:
+        words: list[dict] = []
+        for idx, line in enumerate(resp.lines):
+            next_t = resp.lines[idx + 1].time if idx + 1 < len(resp.lines) else line.time + 3.0
+            toks = [t for t in line.text.split(" ") if t]
+            if not toks:
+                continue
+            unit = max(0.2, (next_t - line.time) / max(1, len(toks)))
+            for i, tok in enumerate(toks):
+                words.append(
+                    {"start": line.time + i * unit, "end": line.time + (i + 1) * unit, "text": tok}
+                )
+        resp.words = words
+        get_conn().execute(
+            "UPDATE songs SET lyrics_word_timing = ? WHERE video_id = ?",
+            (json.dumps(words, ensure_ascii=False), video_id),
+        )
+    return resp
+
+
+@app.post("/api/songs/{video_id}/lyric-offset", status_code=204)
+async def set_lyric_offset(video_id: str, payload: LyricOffsetUpdate) -> None:
+    if payload.video_id != video_id:
+        raise HTTPException(400, "video id mismatch")
+    get_conn().execute(
+        "UPDATE songs SET lyric_offset_sec = ? WHERE video_id = ?",
+        (payload.offset_sec, video_id),
+    )
+
+
+@app.get("/api/users/{user_id}/history")
+async def get_user_history(user_id: str) -> list[dict]:
+    rows = (
+        get_conn()
+        .execute(
+            "SELECT video_id, title, nickname, created_at FROM song_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            (user_id,),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/users/{user_id}/favorites")
+async def add_favorite(user_id: str, payload: dict) -> dict:
+    video_id = str(payload.get("video_id") or "")
+    title = str(payload.get("title") or "")
+    if not video_id or not title:
+        raise HTTPException(400, "video_id/title required")
+    get_conn().execute(
+        "INSERT OR REPLACE INTO favorite_songs (user_id, video_id, title, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, video_id, title, time.time()),
+    )
+    return {"ok": True}
+
+
+@app.get("/api/users/{user_id}/favorites")
+async def get_favorites(user_id: str) -> list[dict]:
+    rows = (
+        get_conn()
+        .execute(
+            "SELECT video_id, title, created_at FROM favorite_songs WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/charts/local")
+async def get_local_charts(period: str = "week") -> list[dict]:
+    span = 7 * 86400 if period == "week" else 30 * 86400
+    cutoff = time.time() - span
+    rows = (
+        get_conn()
+        .execute(
+            """SELECT video_id, title, COUNT(*) AS play_count
+           FROM song_history
+           WHERE created_at >= ?
+           GROUP BY video_id, title
+           ORDER BY play_count DESC, MAX(created_at) DESC
+           LIMIT 50""",
+            (cutoff,),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/artists/popular")
+async def get_popular_artists(limit: int = 40) -> list[dict]:
+    rows = (
+        get_conn()
+        .execute(
+            """SELECT songs.channel AS artist, COUNT(*) AS play_count
+           FROM song_history
+           JOIN songs ON songs.video_id = song_history.video_id
+           WHERE songs.channel IS NOT NULL AND songs.channel != ''
+           GROUP BY songs.channel
+           ORDER BY play_count DESC, MAX(song_history.created_at) DESC
+           LIMIT ?""",
+            (max(1, min(limit, 100)),),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/charts/weekly-hot")
+async def get_weekly_hot(limit: int = 50) -> list[dict]:
+    rows = (
+        get_conn()
+        .execute(
+            "SELECT source, chart_key, video_id, title, artist, rank_no, created_at FROM charts_cache ORDER BY created_at DESC, rank_no ASC LIMIT ?",
+            (max(1, min(limit, 200)),),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/songs/{video_id}/recommend")
+async def recommend(video_id: str) -> list[dict]:
+    row = (
+        get_conn()
+        .execute("SELECT title, channel FROM songs WHERE video_id = ?", (video_id,))
+        .fetchone()
+    )
+    if not row:
+        return []
+    title = str(row["title"] or "")
+    channel = str(row["channel"] or "")
+    md = (
+        get_conn()
+        .execute(
+            "SELECT musicbrainz_artist, spotify_artist_id FROM song_metadata WHERE video_id = ?",
+            (video_id,),
+        )
+        .fetchone()
+    )
+    mb_artist = str(md["musicbrainz_artist"] or "") if md else ""
+
+    cands = (
+        get_conn()
+        .execute(
+            "SELECT video_id, title, channel, thumbnail_url, duration_sec FROM songs WHERE video_id != ? ORDER BY last_seen_at DESC LIMIT 120",
+            (video_id,),
+        )
+        .fetchall()
+    )
+    scored: list[tuple[int, dict]] = []
+    for r in cands:
+        s = 0
+        r_title = str(r["title"] or "")
+        r_channel = str(r["channel"] or "")
+        if channel and r_channel and channel == r_channel:
+            s += 50
+        tset = set(title.lower().split())
+        rset = set(r_title.lower().split())
+        s += min(20, len(tset & rset) * 4)
+        if mb_artist and r_channel and mb_artist.lower() in r_channel.lower():
+            s += 25
+        scored.append((s, dict(r)))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in scored[:12]]
+
+
+@app.post("/api/songs/{video_id}/metadata/sync")
+async def sync_song_metadata(video_id: str) -> dict:
+    row = (
+        get_conn()
+        .execute("SELECT title, channel FROM songs WHERE video_id = ?", (video_id,))
+        .fetchone()
+    )
+    if not row:
+        raise HTTPException(404, "song not found")
+    title = str(row["title"] or "")
+    channel = str(row["channel"] or "") or None
+    mb_artist = await metadata.fetch_musicbrainz_artist(title, channel)
+    sp_artist_id, sp_track_id = await metadata.fetch_spotify_artist_id(title, channel)
+    get_conn().execute(
+        """INSERT INTO song_metadata (video_id, musicbrainz_artist, spotify_artist_id, spotify_track_id, pronunciation_json, updated_at)
+           VALUES (?, ?, ?, ?, COALESCE((SELECT pronunciation_json FROM song_metadata WHERE video_id = ?), NULL), ?)
+           ON CONFLICT(video_id) DO UPDATE SET
+             musicbrainz_artist=excluded.musicbrainz_artist,
+             spotify_artist_id=excluded.spotify_artist_id,
+             spotify_track_id=excluded.spotify_track_id,
+             updated_at=excluded.updated_at""",
+        (video_id, mb_artist, sp_artist_id, sp_track_id, video_id, time.time()),
+    )
+    return {
+        "video_id": video_id,
+        "musicbrainz_artist": mb_artist,
+        "spotify_artist_id": sp_artist_id,
+        "spotify_track_id": sp_track_id,
+    }
+
+
+@app.post("/api/songs/{video_id}/lyrics-correction")
+async def report_lyrics_correction(video_id: str, payload: dict) -> dict:
+    get_conn().execute(
+        "INSERT INTO lyrics_corrections (video_id, line_time, original_text, corrected_text, user_id, created_at, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+        (
+            video_id,
+            payload.get("line_time"),
+            payload.get("original_text"),
+            payload.get("corrected_text") or "",
+            payload.get("user_id"),
+            time.time(),
+        ),
+    )
+    return {"ok": True}
 
 
 @app.post("/api/songs/{video_id}/instrumental", status_code=202)
@@ -461,7 +874,12 @@ async def request_instrumental(video_id: str) -> dict:
             raise HTTPException(503, "karaoke lock cache full, try again later")
         except Exception as exc:
             raise HTTPException(502, f"karaoke render failed: {exc}")
-        return {"status": "done", "video_id": video_id, "path": str(produced), "method": "center_cancel"}
+        return {
+            "status": "done",
+            "video_id": video_id,
+            "path": str(produced),
+            "method": "center_cancel",
+        }
     raise HTTPException(503, "no vocal-removal backend available (need demucs or ffmpeg)")
 
 
@@ -495,35 +913,52 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
         room = rooms_repo.get_room(room_id)
         if room:
             current = queue_repo.get_current_playing(room_id)
-            await ws.send_json({
-                "event": "room.snapshot",
-                "data": {
-                    "room": room.model_dump(),
-                    "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
-                    "current": current.model_dump() if current else None,
-                    "timer": _compute_timer(room).model_dump(),
-                    "participants": broker.list_identities(room_id),
-                },
-            })
+            await ws.send_json(
+                {
+                    "event": "room.snapshot",
+                    "data": {
+                        "room": room.model_dump(),
+                        "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+                        "current": current.model_dump() if current else None,
+                        "timer": _compute_timer(room).model_dump(),
+                        "participants": broker.list_identities(room_id),
+                    },
+                }
+            )
         while True:
             msg = await ws.receive_json()
             event = msg.get("event")
             data = msg.get("data") or {}
             # Echo simple control events as broadcasts (TV uses these for atmosphere)
             if event in {
-                "atmosphere.confetti", "atmosphere.fireworks",
-                "atmosphere.clap", "atmosphere.birthday",
+                "atmosphere.confetti",
+                "atmosphere.fireworks",
+                "atmosphere.clap",
+                "atmosphere.birthday",
             }:
                 await safe_broadcast(room_id, event, data, exclude=ws)
                 kind = event.split(".", 1)[1]
                 combo = _record_atmosphere_and_check_combo(room_id, kind)
                 if combo is not None:
-                    await safe_broadcast(room_id, "atmosphere.combo", {"kind": kind, "count": combo, "multiplier": min(combo // 5 + 1, 5)})
+                    await safe_broadcast(
+                        room_id,
+                        "atmosphere.combo",
+                        {"kind": kind, "count": combo, "multiplier": min(combo // 5 + 1, 5)},
+                    )
             elif event == "identity":
                 await broker.set_identity(room_id, ws, data)
-                await safe_broadcast(room_id, "presence.updated", {
-                    "participants": broker.list_identities(room_id),
-                })
+                room_cur = rooms_repo.get_room(room_id)
+                if room_cur and not getattr(room_cur, "owner_user_id", None):
+                    uid = data.get("user_id")
+                    if isinstance(uid, str) and uid:
+                        rooms_repo.set_owner(room_id, uid)
+                await safe_broadcast(
+                    room_id,
+                    "presence.updated",
+                    {
+                        "participants": broker.list_identities(room_id),
+                    },
+                )
                 nick = data.get("nickname")
                 if nick:
                     await safe_broadcast(room_id, "presence.joined", {"nickname": nick}, exclude=ws)
@@ -535,11 +970,11 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
                 current = queue_repo.get_current_playing(room_id)
                 item_id = data.get("item_id")
                 delta_sec = data.get("delta_sec")
-                if (
-                    current
-                    and item_id == current.id
-                    and isinstance(delta_sec, (int, float))
-                ):
+                if current and item_id == current.id and isinstance(delta_sec, (int, float)):
+                    get_conn().execute(
+                        "UPDATE songs SET lyric_offset_sec = MAX(-2.0, MIN(2.0, COALESCE(lyric_offset_sec, 0.0) + ?)) WHERE video_id = ?",
+                        (float(delta_sec), current.video_id),
+                    )
                     await safe_broadcast(
                         room_id,
                         "lyric.nudge",
@@ -549,6 +984,101 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
                             "delta_sec": delta_sec,
                         },
                         exclude=ws,
+                    )
+            elif event == "skip_current":
+                room_cur = rooms_repo.get_room(room_id)
+                current = queue_repo.get_current_playing(room_id)
+                if not room_cur or not current:
+                    continue
+                mode = getattr(room_cur, "skip_mode", "owner")
+                requester = data.get("user_id")
+                owner = getattr(room_cur, "owner_user_id", None)
+                if mode == "owner":
+                    if requester and requester == owner:
+                        prev = current
+                        item = queue_repo.skip_current(room_id)
+                        queue_repo.clear_votes(room_id, prev.id)
+                        if item:
+                            queue_repo.save_song_history(room_id, prev)
+                        await safe_broadcast(
+                            room_id,
+                            "playback.advanced",
+                            {
+                                "current": item.model_dump() if item else None,
+                                "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+                                "reason": "owner_skip",
+                            },
+                        )
+                else:
+                    uid = requester if isinstance(requester, str) else ""
+                    if not uid:
+                        continue
+                    votes, threshold, passed = queue_repo.vote_skip(
+                        room_id,
+                        current.id,
+                        uid,
+                        len(broker.list_identities(room_id)),
+                    )
+                    await safe_broadcast(
+                        room_id,
+                        "vote_skip",
+                        {
+                            "item_id": current.id,
+                            "votes": votes,
+                            "threshold": threshold,
+                            "passed": passed,
+                        },
+                    )
+                    if passed:
+                        prev = current
+                        item = queue_repo.skip_current(room_id)
+                        queue_repo.clear_votes(room_id, prev.id)
+                        if item:
+                            queue_repo.save_song_history(room_id, prev)
+                        await safe_broadcast(
+                            room_id,
+                            "playback.advanced",
+                            {
+                                "current": item.model_dump() if item else None,
+                                "queue": [i.model_dump() for i in queue_repo.list_queue(room_id)],
+                                "reason": "vote_skip",
+                            },
+                        )
+            elif event == "insert_top":
+                item_id = data.get("item_id")
+                if isinstance(item_id, int) and queue_repo.insert_next(room_id, item_id):
+                    queue = queue_repo.list_queue(room_id)
+                    target = next((q for q in queue if q.id == item_id), None)
+                    await safe_broadcast(
+                        room_id,
+                        "insert_top",
+                        {
+                            "item_id": item_id,
+                            "queue": [i.model_dump() for i in queue],
+                            "message": f"{(target.nickname if target else '有人')} 插播了一首",
+                        },
+                    )
+            elif event == "chat.send":
+                nick = str(data.get("nickname") or "匿名")
+                uid = data.get("user_id")
+                msg_text = str(data.get("message") or "").strip()
+                kind = str(data.get("kind") or "text")
+                if msg_text:
+                    ts = time.time()
+                    get_conn().execute(
+                        "INSERT INTO chat_messages (room_id, user_id, nickname, message, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (room_id, uid, nick, msg_text[:200], kind[:16], ts),
+                    )
+                    await safe_broadcast(
+                        room_id,
+                        "chat.message",
+                        {
+                            "nickname": nick,
+                            "user_id": uid,
+                            "message": msg_text[:200],
+                            "kind": kind[:16],
+                            "created_at": ts,
+                        },
                     )
             elif event == "ping":
                 # Echo back the ts so the client can compute round-trip latency.
@@ -567,4 +1097,6 @@ async def ws_room(ws: WebSocket, room_id: str) -> None:
         await broker.disconnect(room_id, ws)
         if identity:
             await safe_broadcast(room_id, "presence.left", {"nickname": identity.get("nickname")})
-            await safe_broadcast(room_id, "presence.updated", {"participants": broker.list_identities(room_id)})
+            await safe_broadcast(
+                room_id, "presence.updated", {"participants": broker.list_identities(room_id)}
+            )

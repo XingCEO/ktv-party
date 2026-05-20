@@ -112,8 +112,17 @@ vi.mock("@/lib/api", async () => {
         instrumental_url: null,
         expires_at: null,
         has_subs: false,
+        intro_trim_sec: 0,
+        outro_trim_sec: 0,
       })),
       getLyrics: vi.fn(async () => ({ video_id: "x", source: "fallback", title: null, artist: null, lines: [] })),
+      getPronunciation: vi.fn(async () => ({ video_id: "x", lang: "zh", items: [] })),
+      getLocalCharts: vi.fn(async () => []),
+      getPopularArtists: vi.fn(async () => []),
+      setSkipMode: vi.fn(async () => undefined),
+      setTheme: vi.fn(async () => undefined),
+      extendRoom: vi.fn(async () => undefined),
+      setLyricOffset: vi.fn(async () => undefined),
     },
   };
 });

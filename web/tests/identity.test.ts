@@ -3,7 +3,7 @@ import { ensureIdentity, getIdentity, clearIdentity } from "@/lib/identity";
 
 describe("identity", () => {
   beforeEach(() => {
-    window.localStorage.clear();
+    if (typeof window !== "undefined" && window.localStorage) window.localStorage.clear();
   });
 
   it("returns null when nothing stored", () => {
@@ -32,7 +32,9 @@ describe("identity", () => {
   });
 
   it("handles malformed JSON gracefully", () => {
-    window.localStorage.setItem("ktv-identity-v1", "{not json");
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem("ktv-identity-v1", "{not json");
+    }
     expect(getIdentity()).toBeNull();
   });
 });

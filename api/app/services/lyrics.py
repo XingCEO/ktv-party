@@ -1,4 +1,5 @@
 """Lyrics service: prefer YT subtitles (.vtt), fallback LRCLIB.net, then plain title."""
+
 from __future__ import annotations
 
 import hashlib
@@ -15,9 +16,14 @@ from ..schemas import LyricLine, LyricsResponse
 
 logger = logging.getLogger(__name__)
 
-_VTT_TS = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})"
-)
+try:
+    from opencc import OpenCC  # type: ignore
+except Exception:  # pragma: no cover
+    OpenCC = None
+
+_OPENCC = OpenCC("s2tw") if OpenCC else None
+
+_VTT_TS = re.compile(r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})")
 _TAGS = re.compile(r"<[^>]+>")
 
 
@@ -222,7 +228,9 @@ def _artist_match(expected: Optional[str], item_artist: str) -> bool:
     return False
 
 
-def _pick_search_hit(items: list[dict], expected_title: str, expected_artist: Optional[str]) -> Optional[str]:
+def _pick_search_hit(
+    items: list[dict], expected_title: str, expected_artist: Optional[str]
+) -> Optional[str]:
     """Pick the BEST lyric body from /api/search results.
 
     Filtering rules:
@@ -255,9 +263,8 @@ def _pick_search_hit(items: list[dict], expected_title: str, expected_artist: Op
             # With artist confirmed, allow either-direction substring on title:
             # the canonical name might live inside our noisy query OR vice-versa
             # (lrclib often decorates trackName with pinyin/translation suffixes).
-            if (
-                name_norm != expected_t
-                and (not name_norm or (name_norm not in expected_t and expected_t not in name_norm))
+            if name_norm != expected_t and (
+                not name_norm or (name_norm not in expected_t and expected_t not in name_norm)
             ):
                 continue
         else:
@@ -348,6 +355,8 @@ async def get_lyrics(
         try:
             lines = parse_vtt(Path(vtt_path).read_text(encoding="utf-8", errors="ignore"))
             if lines:
+                if _OPENCC:
+                    lines = [LyricLine(time=l.time, text=_OPENCC.convert(l.text)) for l in lines]
                 resp = LyricsResponse(
                     video_id=video_id, source="youtube", title=title, artist=artist, lines=lines
                 )
@@ -362,6 +371,8 @@ async def get_lyrics(
         if text:
             lines = parse_lrc(text)
             if lines:
+                if _OPENCC:
+                    lines = [LyricLine(time=l.time, text=_OPENCC.convert(l.text)) for l in lines]
                 resp = LyricsResponse(
                     video_id=video_id, source="lrclib", title=title, artist=artist, lines=lines
                 )

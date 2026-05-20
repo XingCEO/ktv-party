@@ -1,4 +1,5 @@
 """SQLite database access layer with simple connection management."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -16,7 +17,11 @@ CREATE TABLE IF NOT EXISTS rooms (
     name TEXT NOT NULL,
     created_at REAL NOT NULL,
     timer_started_at REAL,
-    rate_per_minute REAL NOT NULL DEFAULT 8.0
+    rate_per_minute REAL NOT NULL DEFAULT 8.0,
+    skip_mode TEXT NOT NULL DEFAULT 'owner', -- owner|vote
+    owner_user_id TEXT,
+    theme TEXT NOT NULL DEFAULT 'cashbox-green',
+    ends_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -36,7 +41,11 @@ CREATE TABLE IF NOT EXISTS songs (
     last_seen_at REAL NOT NULL,
     instrumental_path TEXT,
     instrumental_status TEXT NOT NULL DEFAULT 'none', -- none|pending|running|done|failed
-    instrumental_error TEXT
+    instrumental_error TEXT,
+    lyrics_word_timing TEXT,
+    lyric_offset_sec REAL NOT NULL DEFAULT 0.0,
+    intro_trim_sec REAL NOT NULL DEFAULT 0.0,
+    outro_trim_sec REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS queue_items (
@@ -49,12 +58,90 @@ CREATE TABLE IF NOT EXISTS queue_items (
     duration_sec INTEGER,
     thumbnail_url TEXT,
     vocal_mode TEXT NOT NULL DEFAULT 'original', -- original|instrumental
+    performance_mode TEXT NOT NULL DEFAULT 'solo', -- solo|duet|chorus
+    duet_partner_user_id TEXT,
+    duet_partner_nickname TEXT,
+    dedicate_to_user_id TEXT,
+    dedicate_to_nickname TEXT,
     position INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued', -- queued|playing|done|skipped
     added_at REAL NOT NULL,
     started_at REAL,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
     FOREIGN KEY (video_id) REFERENCES songs(video_id)
+);
+
+CREATE TABLE IF NOT EXISTS vote_skip (
+    room_id TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (room_id, item_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS song_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL,
+    user_id TEXT,
+    nickname TEXT,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS favorite_songs (
+    user_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (user_id, video_id)
+);
+
+CREATE TABLE IF NOT EXISTS device_profiles (
+    user_id TEXT PRIMARY KEY,
+    fingerprint TEXT,
+    last_seen_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL,
+    user_id TEXT,
+    nickname TEXT NOT NULL,
+    message TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'text', -- text|emoji
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lyrics_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL,
+    line_time REAL,
+    original_text TEXT,
+    corrected_text TEXT NOT NULL,
+    user_id TEXT,
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE TABLE IF NOT EXISTS charts_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    chart_key TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT,
+    rank_no INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS song_metadata (
+    video_id TEXT PRIMARY KEY,
+    musicbrainz_artist TEXT,
+    spotify_artist_id TEXT,
+    spotify_track_id TEXT,
+    pronunciation_json TEXT,
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -144,3 +231,23 @@ def init_db() -> None:
         conn.execute("ALTER TABLE queue_items ADD COLUMN started_at REAL")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    migrations = [
+        ("ALTER TABLE songs ADD COLUMN lyrics_word_timing TEXT",),
+        ("ALTER TABLE songs ADD COLUMN lyric_offset_sec REAL NOT NULL DEFAULT 0.0",),
+        ("ALTER TABLE songs ADD COLUMN intro_trim_sec REAL NOT NULL DEFAULT 0.0",),
+        ("ALTER TABLE songs ADD COLUMN outro_trim_sec REAL NOT NULL DEFAULT 0.0",),
+        ("ALTER TABLE rooms ADD COLUMN skip_mode TEXT NOT NULL DEFAULT 'owner'",),
+        ("ALTER TABLE rooms ADD COLUMN owner_user_id TEXT",),
+        ("ALTER TABLE rooms ADD COLUMN theme TEXT NOT NULL DEFAULT 'cashbox-green'",),
+        ("ALTER TABLE rooms ADD COLUMN ends_at REAL",),
+        ("ALTER TABLE queue_items ADD COLUMN performance_mode TEXT NOT NULL DEFAULT 'solo'",),
+        ("ALTER TABLE queue_items ADD COLUMN duet_partner_user_id TEXT",),
+        ("ALTER TABLE queue_items ADD COLUMN duet_partner_nickname TEXT",),
+        ("ALTER TABLE queue_items ADD COLUMN dedicate_to_user_id TEXT",),
+        ("ALTER TABLE queue_items ADD COLUMN dedicate_to_nickname TEXT",),
+    ]
+    for (stmt,) in migrations:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass

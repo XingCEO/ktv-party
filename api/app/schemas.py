@@ -1,4 +1,5 @@
 """Pydantic schemas for request/response payloads."""
+
 from __future__ import annotations
 
 from typing import Literal, Optional
@@ -17,6 +18,10 @@ class Room(BaseModel):
     created_at: float
     timer_started_at: Optional[float] = None
     rate_per_minute: float
+    skip_mode: Literal["owner", "vote"] = "owner"
+    owner_user_id: Optional[str] = None
+    theme: str = "cashbox-green"
+    ends_at: Optional[float] = None
 
 
 class RoomTimer(BaseModel):
@@ -45,6 +50,11 @@ class QueueAdd(BaseModel):
     nickname: str = Field(..., min_length=1, max_length=32)
     user_id: Optional[str] = None
     vocal_mode: Literal["original", "instrumental"] = "original"
+    performance_mode: Literal["solo", "duet", "chorus"] = "solo"
+    duet_partner_user_id: Optional[str] = None
+    duet_partner_nickname: Optional[str] = None
+    dedicate_to_user_id: Optional[str] = None
+    dedicate_to_nickname: Optional[str] = None
 
 
 class QueueItem(BaseModel):
@@ -57,6 +67,11 @@ class QueueItem(BaseModel):
     duration_sec: Optional[int]
     thumbnail_url: Optional[str]
     vocal_mode: Literal["original", "instrumental"]
+    performance_mode: Literal["solo", "duet", "chorus"] = "solo"
+    duet_partner_user_id: Optional[str] = None
+    duet_partner_nickname: Optional[str] = None
+    dedicate_to_user_id: Optional[str] = None
+    dedicate_to_nickname: Optional[str] = None
     position: int
     status: Literal["queued", "playing", "done", "skipped"]
     added_at: float
@@ -78,10 +93,18 @@ class StreamInfo(BaseModel):
     instrumental_url: Optional[str] = None
     expires_at: Optional[float] = None
     has_subs: bool = False
+    intro_trim_sec: float = 0.0
+    outro_trim_sec: float = 0.0
 
 
 class LyricLine(BaseModel):
     time: float
+    text: str
+
+
+class LyricWord(BaseModel):
+    start: float
+    end: float
     text: str
 
 
@@ -91,6 +114,13 @@ class LyricsResponse(BaseModel):
     title: Optional[str] = None
     artist: Optional[str] = None
     lines: list[LyricLine] = []
+    words: list[LyricWord] = []
+    lyric_offset_sec: float = 0.0
+
+
+class LyricOffsetUpdate(BaseModel):
+    video_id: str
+    offset_sec: float = Field(0.0, ge=-2.0, le=2.0)
 
 
 class HealthResponse(BaseModel):

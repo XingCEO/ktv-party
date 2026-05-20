@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, type Room } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import { Card, CardBody } from "@/components/ui/Card";
@@ -10,24 +10,37 @@ import { ToastProvider, useToast } from "@/components/ui/Toast";
 
 function HomePageContent() {
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [tab, setTab] = useState<"search" | "hot" | "artist" | "history">("search");
+  const [hot, setHot] = useState<Array<{ video_id: string; title: string; play_count: number }>>([]);
+  const [artists, setArtists] = useState<Array<{ artist: string; play_count: number }>>([]);
+  const [history, setHistory] = useState<Array<{ title: string; created_at: number }>>([]);
   const [name, setName] = useState("");
   const [rate, setRate] = useState(8);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const toast = useToast();
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       setRooms(await api.listRooms());
     } catch (e: any) {
       toast({ variant: "error", message: e.message || "載入包廂失敗" });
     }
-  }
+  }, [toast]);
 
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    api.getLocalCharts("week").then(setHot).catch(() => {});
+    api.getPopularArtists(30).then(setArtists).catch(() => {});
+    if (typeof window !== "undefined") {
+      const raw = window.localStorage?.getItem?.("ktv-local-history");
+      if (raw) {
+        try {
+          setHistory(JSON.parse(raw));
+        } catch {}
+      }
+    }
+  }, [load]);
 
   async function create() {
     if (!name.trim()) {
@@ -79,8 +92,9 @@ function HomePageContent() {
           <div className="absolute top-0 right-0 p-32 bg-ktv-accent/5 rounded-full blur-3xl -z-10 group-hover:bg-ktv-accent/10 transition-colors duration-500" />
           <CardBody className="p-6 md:p-8 flex flex-col md:flex-row gap-4 items-end">
             <div className="w-full flex-1">
-              <label className="block text-sm font-bold text-white/80 mb-2">建立新包廂</label>
+              <label htmlFor="room-name" className="block text-sm font-bold text-white/80 mb-2">建立新包廂</label>
               <Input
+                id="room-name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="例如: 週末狂歡夜"
@@ -88,8 +102,9 @@ function HomePageContent() {
               />
             </div>
             <div className="w-full md:w-32">
-              <label className="block text-sm font-bold text-white/80 mb-2">費率</label>
+              <label htmlFor="room-rate" className="block text-sm font-bold text-white/80 mb-2">費率</label>
               <Input
+                id="room-rate"
                 type="number"
                 value={rate}
                 onChange={(e) => setRate(Number(e.target.value))}
@@ -107,6 +122,33 @@ function HomePageContent() {
             >
               建立包廂
             </Button>
+          </CardBody>
+        </Card>
+
+        <Card className="bg-panel border-white/10">
+          <CardBody className="p-4">
+            <div className="flex gap-2 mb-3 text-sm">
+              <Button variant={tab === "search" ? "primary" : "ghost"} onClick={() => setTab("search")}>搜尋</Button>
+              <Button variant={tab === "hot" ? "primary" : "ghost"} onClick={() => setTab("hot")}>熱門</Button>
+              <Button variant={tab === "artist" ? "primary" : "ghost"} onClick={() => setTab("artist")}>歌手</Button>
+              <Button variant={tab === "history" ? "primary" : "ghost"} onClick={() => setTab("history")}>點唱史</Button>
+            </div>
+            {tab === "hot" && (
+              <ul className="space-y-1 text-sm">
+                {hot.slice(0, 10).map((h, i) => <li key={`${h.video_id}-${h.title}`}>{i + 1}. {h.title} · {h.play_count}</li>)}
+              </ul>
+            )}
+            {tab === "artist" && (
+              <ul className="space-y-1 text-sm">
+                {artists.slice(0, 10).map((a) => <li key={a.artist}>{a.artist} · {a.play_count}</li>)}
+              </ul>
+            )}
+            {tab === "history" && (
+              <ul className="space-y-1 text-sm">
+                {history.slice(0, 10).map((h, i) => <li key={`${h.title}-${h.created_at || i}`}>{h.title}</li>)}
+              </ul>
+            )}
+            {tab === "search" && <div className="text-sm text-white/60">使用上方包廂搜尋/建立流程</div>}
           </CardBody>
         </Card>
 

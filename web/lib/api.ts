@@ -5,6 +5,10 @@ export type Room = {
   created_at: number;
   timer_started_at: number | null;
   rate_per_minute: number;
+  skip_mode?: "owner" | "vote";
+  owner_user_id?: string | null;
+  theme?: string;
+  ends_at?: number | null;
 };
 
 export type RoomTimer = {
@@ -25,6 +29,7 @@ export type SearchResult = {
 };
 
 export type VocalMode = "original" | "instrumental";
+export type PerformanceMode = "solo" | "duet" | "chorus";
 export type QueueStatus = "queued" | "playing" | "done" | "skipped";
 
 export type QueueItem = {
@@ -37,6 +42,11 @@ export type QueueItem = {
   duration_sec: number | null;
   thumbnail_url: string | null;
   vocal_mode: VocalMode;
+  performance_mode?: PerformanceMode;
+  duet_partner_user_id?: string | null;
+  duet_partner_nickname?: string | null;
+  dedicate_to_user_id?: string | null;
+  dedicate_to_nickname?: string | null;
   position: number;
   status: QueueStatus;
   added_at: number;
@@ -50,15 +60,20 @@ export type StreamInfo = {
   instrumental_url: string | null;
   expires_at: number | null;
   has_subs: boolean;
+  intro_trim_sec: number;
+  outro_trim_sec: number;
 };
 
 export type LyricLine = { time: number; text: string };
+export type LyricWord = { start: number; end: number; text: string };
 export type LyricsResponse = {
   video_id: string;
   source: "youtube" | "lrclib" | "fallback";
   title: string | null;
   artist: string | null;
   lines: LyricLine[];
+  words: LyricWord[];
+  lyric_offset_sec: number;
 };
 
 const BASE = ""; // Same-origin via Next.js rewrites.
@@ -89,6 +104,10 @@ export const api = {
   getTimer: (id: string) => req<RoomTimer>(`/api/rooms/${id}/timer`),
   startTimer: (id: string) => req<RoomTimer>(`/api/rooms/${id}/timer`, { method: "POST" }),
   resetTimer: (id: string) => req<RoomTimer>(`/api/rooms/${id}/timer`, { method: "DELETE" }),
+  setEndsAt: (id: string, ends_at: number | null) =>
+    req<void>(`/api/rooms/${id}/ends-at`, { method: "POST", body: JSON.stringify({ ends_at }) }),
+  extendRoom: (id: string, minutes: number) =>
+    req<void>(`/api/rooms/${id}/extend`, { method: "POST", body: JSON.stringify({ minutes }) }),
 
   getQueue: (id: string) => req<QueueItem[]>(`/api/rooms/${id}/queue`),
   addToQueue: (
@@ -102,6 +121,11 @@ export const api = {
       nickname: string;
       user_id?: string;
       vocal_mode?: VocalMode;
+      performance_mode?: PerformanceMode;
+      duet_partner_user_id?: string | null;
+      duet_partner_nickname?: string | null;
+      dedicate_to_user_id?: string | null;
+      dedicate_to_nickname?: string | null;
     },
   ) => req<QueueItem>(`/api/rooms/${id}/queue`, { method: "POST", body: JSON.stringify(payload) }),
   removeQueueItem: (room: string, item: number) =>
@@ -118,11 +142,17 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ vocal_mode }),
     }),
+  setSkipMode: (room: string, mode: "owner" | "vote") =>
+    req<void>(`/api/rooms/${room}/skip-mode/${mode}`, { method: "POST" }),
+  setTheme: (room: string, theme: string) =>
+    req<void>(`/api/rooms/${room}/theme/${encodeURIComponent(theme)}`, { method: "POST" }),
   playbackNext: (room: string) =>
     req<QueueItem | null>(`/api/rooms/${room}/playback/next`, { method: "POST" }),
 
   search: (q: string, n = 10) => req<SearchResult[]>(`/api/search?q=${encodeURIComponent(q)}&n=${n}`),
   getStream: (video_id: string) => req<StreamInfo>(`/api/songs/${video_id}/stream`),
+  autoTrim: (video_id: string, duration_sec: number) =>
+    req<void>(`/api/songs/${video_id}/trim-auto`, { method: "POST", body: JSON.stringify({ duration_sec }) }),
   getLyrics: (video_id: string, title?: string, artist?: string, force?: boolean) => {
     const qs = new URLSearchParams();
     if (title) qs.set("title", title);
@@ -131,6 +161,21 @@ export const api = {
     const tail = qs.toString() ? `?${qs}` : "";
     return req<LyricsResponse>(`/api/songs/${video_id}/lyrics${tail}`);
   },
+  setLyricOffset: (video_id: string, offset_sec: number) =>
+    req<void>(`/api/songs/${video_id}/lyric-offset`, {
+      method: "POST",
+      body: JSON.stringify({ video_id, offset_sec }),
+    }),
+  getLocalCharts: (period: "week" | "month" = "week") =>
+    req<Array<{ video_id: string; title: string; play_count: number }>>(`/api/charts/local?period=${period}`),
+  getPopularArtists: (limit = 40) =>
+    req<Array<{ artist: string; play_count: number }>>(`/api/artists/popular?limit=${limit}`),
+  getPronunciation: (video_id: string, lang: "zh" | "ja" = "zh") =>
+    req<{ video_id: string; lang: string; items: Array<{ idx: number; text: string; anno: string }> }>(`/api/songs/${video_id}/pronunciation?lang=${lang}`),
+  syncSongMetadata: (video_id: string) =>
+    req<{ video_id: string; musicbrainz_artist: string | null; spotify_artist_id: string | null; spotify_track_id: string | null }>(`/api/songs/${video_id}/metadata/sync`, { method: "POST" }),
+  reportLyricsCorrection: (video_id: string, payload: { line_time?: number; original_text?: string; corrected_text: string; user_id?: string }) =>
+    req<{ ok: boolean }>(`/api/songs/${video_id}/lyrics-correction`, { method: "POST", body: JSON.stringify(payload) }),
   requestInstrumental: (video_id: string) =>
     req<{ status: string; job_id?: string; path?: string }>(`/api/songs/${video_id}/instrumental`, {
       method: "POST",
